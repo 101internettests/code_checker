@@ -82,6 +82,14 @@ def sheet_name_for_run(tz_name: str) -> str:
     return dt.strftime("%Y-%m-%d_%H-%M-%S")
 
 
+def format_duration(seconds: float) -> str:
+    total_seconds = int(round(seconds))
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def extract_site_domain(url: str) -> Tuple[str, str]:
     """
     Returns (site_base_domain, host).
@@ -368,6 +376,7 @@ def main():
 
     total_pages = 0
     total_ok = 0
+    run_start = time.perf_counter()
     for site, site_urls in groups.items():
         logger.info("Checking site: %s (%d pages)", site, len(site_urls))
         try:
@@ -382,10 +391,12 @@ def main():
     if cfg["alerts_enabled"] and cfg.get("success_alerts_enabled", True):
         if total_pages > 0 and total_ok == total_pages:
             run_timestamp = now_local_str(cfg["timezone"])
+            duration = time.perf_counter() - run_start
             ok_msg = (
                 f"✅ Проверка пройдена\n"
                 f"Проверено ссылок: {total_pages}\n"
-                f"Время проверки: {run_timestamp}"
+                f"Время проверки: {run_timestamp}\n"
+                f"Длительность: {format_duration(duration)}"
             )
             send_telegram_message(cfg["bot_token"], cfg["chat_id"], ok_msg)
 
