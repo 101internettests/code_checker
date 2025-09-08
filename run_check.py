@@ -36,7 +36,8 @@ logger = logging.getLogger(__name__)
 
 # --------------- Env ---------------
 def load_config() -> dict:
-    load_dotenv(override=True)
+    # Do NOT override existing env (e.g., Jenkins), local .env only fills missing values
+    load_dotenv(override=False)
 
     config = {
         "urls_file": os.getenv("URLS_FILE", ""),
@@ -61,6 +62,15 @@ def load_config() -> dict:
             missing.append(key)
     if missing:
         logger.warning("Missing required envs for Google Sheets or URL list: %s", ", ".join(missing))
+
+    # Helpful log to verify which chat id is used in CI
+    try:
+        logger.info(
+            "Config: ALERTS_ENABLED=%s SUCCESS_ALERTS_ENABLED=%s SHEET_MODE=%s CHAT_ID=%s",
+            config["alerts_enabled"], config.get("success_alerts_enabled", True), config.get("sheet_mode"), config.get("chat_id")
+        )
+    except Exception:
+        pass
 
     return config
 
