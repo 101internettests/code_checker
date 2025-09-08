@@ -13,6 +13,10 @@ import gspread
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 import tldextract
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+# Suppress warnings when verify=False is used intentionally to fetch status codes despite SSL issues
+requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 
 
 # --------------- Configuration ---------------
@@ -139,14 +143,14 @@ def check_ssl_valid(domain: str, timeout: int = 10) -> Tuple[bool, Optional[str]
 
 
 # --------------- HTTP Request ---------------
-def request_with_timing(url: str, timeout: int) -> Tuple[Optional[int], float, Optional[str]]:
+def request_with_timing(url: str, timeout: int, verify_ssl: bool = True) -> Tuple[Optional[int], float, Optional[str]]:
     """
     Returns (status_code, response_ms, error_message)
     status_code is None on network/timeout error
     """
     start = time.perf_counter()
     try:
-        resp = requests.get(url, timeout=timeout, allow_redirects=True)
+        resp = requests.get(url, timeout=timeout, allow_redirects=True, verify=verify_ssl)
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         return resp.status_code, elapsed_ms, None
     except requests.Timeout:
@@ -255,17 +259,10 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
 
     rows_to_append: List[List[str]] = []
 
+    # If SSL invalid, alert but continue to perform HTTP checks; mark rows with note
+    ssl_note: Optional[str] = None
     if not ssl_valid:
         logger.error("[%s] SSL invalid: %s", site, ssl_detail)
-        # Record one row per page to keep history
-        for u in urls:
-            _, host = extract_site_domain(u)
-            rows_to_append.append([
-                timestamp, site, host, "", "", "SSL_INVALID", ssl_detail or ""
-            ])
-        if ws:
-            append_rows(ws, rows_to_append)
-        # Immediate alert for SSL
         if cfg["alerts_enabled"]:
             msg = (
                 f"🚨 [ALERT] Проблема с SSL сертификатом 🔒\n"
@@ -274,12 +271,17 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                 f"Время проверки: {timestamp}"
             )
             send_telegram_message(cfg["bot_token"], cfg["chat_id"], msg)
-        return {"num_pages": len(urls), "num_ok": 0}
+        ssl_note = ssl_detail or "сертификат недействителен"
 
     # HTTP checks
     results = []  # list of tuples (url, host, status, ms, err)
     for u in urls:
-        status, ms, err = request_with_timing(u, cfg["timeout_seconds"])
+        # If SSL is invalid, bypass verification to still get HTTP status codes
+        status, ms, err = request_with_timing(
+            u,
+            cfg["timeout_seconds"],
+            verify_ssl=ssl_valid  # True normally, False if SSL invalid
+        )
         _, host = extract_site_domain(u)
         results.append((u, host, status, ms, err))
 
@@ -287,13 +289,17 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
     for (_u, host, status, ms, err) in results:
         if status is None:
             res = "TIMEOUT" if (err == "timeout") else "NETWORK_ERROR"
+            note = err or ""
+            if ssl_note:
+                note = (note + ("; " if note else "")) + f"SSL_INVALID: {ssl_note}"
             rows_to_append.append([
-                timestamp, site, host, "", f"{ms:.0f}", res, err or ""
+                timestamp, site, host, "", f"{ms:.0f}", res, note
             ])
         else:
             res = "OK" if (200 <= status < 400) else ("ERROR_404" if status == 404 else ("ERROR_5XX" if 500 <= status < 600 else "ERROR"))
+            note = f"SSL_INVALID: {ssl_note}" if ssl_note else ""
             rows_to_append.append([
-                timestamp, site, host, str(status), f"{ms:.0f}", res, ""
+                timestamp, site, host, str(status), f"{ms:.0f}", res, note
             ])
 
     if ws:
@@ -305,20 +311,23 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
 
     all_404 = bool(status_non_none) and all(s == 404 for s in status_non_none) and len(status_non_none) == len(results)
     all_5xx = bool(status_non_none) and all(500 <= s < 600 for s in status_non_none) and len(status_non_none) == len(results)
+    count_404 = sum(1 for s in status_non_none if s == 404)
+    count_5xx = sum(1 for s in status_non_none if 500 <= s < 600)
 
     # Immediate alerts per conditions
     if cfg["alerts_enabled"]:
         if all_404:
             msg = (
                 f"🛑 [CRITICAL] Ошибка доступа ко всем страницам на лендинге\n"
-                f"Все страницы сайта {site} вернули ошибку 404\n"
+                f"Сайт: {site}\n"
+                f"Страниц с ошибкой 404: {count_404} из {len(results)}\n"
                 f"Время проверки: {timestamp}"
             )
             send_telegram_message(cfg["bot_token"], cfg["chat_id"], msg)
         elif all_5xx:
             msg = (
                 f"🛑 [CRITICAL] Сайт {site} недоступен\n"
-                f"Все страницы вернули ошибку 5хх\n"
+                f"Страниц с ошибкой 5хх: {count_5xx} из {len(results)}\n"
                 f"Время проверки: {timestamp}"
             )
             send_telegram_message(cfg["bot_token"], cfg["chat_id"], msg)
