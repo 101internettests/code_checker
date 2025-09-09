@@ -14,6 +14,8 @@ from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 import tldextract
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
+import json
+from pathlib import Path
 
 # Suppress warnings when verify=False is used intentionally to fetch status codes despite SSL issues
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
@@ -57,7 +59,9 @@ def load_config() -> dict:
         # daily: один лист на дату; per_run: новый лист на каждый запуск (по умолчанию)
         "sheet_mode": os.getenv("SHEET_MODE", "per_run").strip().lower(),
         # отправлять ли сообщение об успешной проверке
-        "success_alerts_enabled": os.getenv("SUCCESS_ALERTS_ENABLED", "true").lower() in {"1", "true", "yes"}
+        "success_alerts_enabled": os.getenv("SUCCESS_ALERTS_ENABLED", "true").lower() in {"1", "true", "yes"},
+        # путь до stats.json (если задан, пишем сводку)
+        "stats_file": os.getenv("STATS_FILE", "").strip()
     }
 
     missing = []
@@ -261,6 +265,7 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
 
     # If SSL invalid, alert but continue to perform HTTP checks; mark rows with note
     ssl_note: Optional[str] = None
+    ssl_invalid_flag = False
     if not ssl_valid:
         logger.error("[%s] SSL invalid: %s", site, ssl_detail)
         if cfg["alerts_enabled"]:
@@ -272,6 +277,7 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
             )
             send_telegram_message(cfg["bot_token"], cfg["chat_id"], msg)
         ssl_note = ssl_detail or "сертификат недействителен"
+        ssl_invalid_flag = True
 
     # HTTP checks
     results = []  # list of tuples (url, host, status, ms, err)
@@ -353,7 +359,9 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                     send_telegram_message(cfg["bot_token"], cfg["chat_id"], text)
 
     num_ok = sum(1 for (_u, _h, status, _ms, _e) in results if status is not None and 200 <= status < 400)
-    return {"num_pages": len(results), "num_ok": num_ok}
+    # неуспехи учитываем только для 404 и 5xx (как по условиям алертов)
+    num_failed = sum(1 for (_u, _h, status, _ms, _e) in results if (status == 404) or (status is not None and 500 <= status < 600))
+    return {"num_pages": len(results), "num_ok": num_ok, "num_failed": num_failed, "ssl_invalid": ssl_invalid_flag}
 
 
 def main():
@@ -395,6 +403,8 @@ def main():
 
     total_pages = 0
     total_ok = 0
+    total_failed_pages = 0
+    ssl_issues_sites = 0
     run_start = time.perf_counter()
     for site, site_urls in groups.items():
         logger.info("Checking site: %s (%d pages)", site, len(site_urls))
@@ -403,6 +413,8 @@ def main():
             if isinstance(result, dict):
                 total_pages += int(result.get("num_pages", 0))
                 total_ok += int(result.get("num_ok", 0))
+                total_failed_pages += int(result.get("num_failed", 0))
+                ssl_issues_sites += 1 if result.get("ssl_invalid") else 0
         except Exception as e:
             logger.exception("Unexpected error while processing site %s: %s", site, e)
 
@@ -418,6 +430,59 @@ def main():
                 f"Длительность: {format_duration(duration)}"
             )
             send_telegram_message(cfg["bot_token"], cfg["chat_id"], ok_msg)
+
+    # Write stats.json if configured (aggregate per day, do not overwrite)
+    if cfg.get("stats_file"):
+        run_timestamp = now_local_str(cfg["timezone"])
+        # A run is successful if there were NO SSL issues and NO 404/5xx across all pages
+        success_run = 1 if (int(ssl_issues_sites) == 0 and int(total_failed_pages) == 0) else 0
+        failure_run = 1 - success_run
+        run_date = datetime.now(ZoneInfo(cfg["timezone"]))\
+            .strftime("%Y-%m-%d")
+        try:
+            stats_path = Path(cfg["stats_file"])
+            if stats_path.parent and not stats_path.parent.exists():
+                stats_path.parent.mkdir(parents=True, exist_ok=True)
+            # Load existing stats (aggregate per date)
+            if stats_path.exists():
+                try:
+                    with open(stats_path, "r", encoding="utf-8") as f:
+                        stats_obj = json.load(f)
+                except Exception:
+                    stats_obj = {}
+            else:
+                stats_obj = {}
+
+            if not isinstance(stats_obj, dict):
+                stats_obj = {}
+
+            entry = stats_obj.get(run_date, {}) if isinstance(stats_obj.get(run_date, {}), dict) else {}
+            # Aggregate runs per day
+            entry_success = int(entry.get("success", 0)) + success_run
+            entry_failure = int(entry.get("failure", 0)) + failure_run
+            entry_total_pages = int(entry.get("total_pages", 0)) + int(total_pages)
+            entry_failed_pages = int(entry.get("failed_pages", 0)) + int(total_failed_pages)
+            entry_ssl_issues_sites = int(entry.get("ssl_issues_sites", 0)) + int(ssl_issues_sites)
+            entry_runs = int(entry.get("runs", 0)) + 1
+
+            entry.update({
+                "summary": f"Сводка: успешно {entry_success}, неуспешно {entry_failure}",
+                "success": entry_success,
+                "failure": entry_failure,
+                "total_pages": entry_total_pages,
+                "failed_pages": entry_failed_pages,
+                "ssl_issues_sites": entry_ssl_issues_sites,
+                "runs": entry_runs,
+                "last_timestamp": run_timestamp
+            })
+
+            stats_obj[run_date] = entry
+
+            with open(stats_path, "w", encoding="utf-8") as f:
+                json.dump(stats_obj, f, ensure_ascii=False, indent=2)
+            logger.info("Stats updated for %s in %s: %s", run_date, stats_path, entry["summary"])
+        except Exception as e:
+            logger.error("Failed to write stats file %s: %s", cfg["stats_file"], e)
 
 
 if __name__ == "__main__":
