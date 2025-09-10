@@ -262,20 +262,17 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
             ssl_valid, ssl_detail = False, detail
 
     rows_to_append: List[List[str]] = []
+    errors_404: List[str] = []
+    errors_5xx: List[Tuple[str, int]] = []
+    errors_timeout: List[str] = []
+    errors_network: List[str] = []
+    errors_other: List[Tuple[str, int]] = []
 
     # If SSL invalid, alert but continue to perform HTTP checks; mark rows with note
     ssl_note: Optional[str] = None
     ssl_invalid_flag = False
     if not ssl_valid:
         logger.error("[%s] SSL invalid: %s", site, ssl_detail)
-        if cfg["alerts_enabled"]:
-            msg = (
-                f"🚨 [ALERT] Проблема с SSL сертификатом 🔒\n"
-                f"Сайт: {site}\n"
-                f"Описание: {ssl_detail or 'сертификат недействителен'}\n"
-                f"Время проверки: {timestamp}"
-            )
-            send_telegram_message(cfg["bot_token"], cfg["chat_id"], msg)
         ssl_note = ssl_detail or "сертификат недействителен"
         ssl_invalid_flag = True
 
@@ -291,7 +288,7 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
         _, host = extract_site_domain(u)
         results.append((u, host, status, ms, err))
 
-    # Append to sheet
+    # Append to sheet (only errors) and collect aggregation
     for (_u, host, status, ms, err) in results:
         if status is None:
             res = "TIMEOUT" if (err == "timeout") else "NETWORK_ERROR"
@@ -301,62 +298,49 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
             rows_to_append.append([
                 timestamp, site, host, "", f"{ms:.0f}", res, note
             ])
+            if err == "timeout":
+                errors_timeout.append(_u)
+            else:
+                errors_network.append(_u)
         else:
-            res = "OK" if (200 <= status < 400) else ("ERROR_404" if status == 404 else ("ERROR_5XX" if 500 <= status < 600 else "ERROR"))
-            note = f"SSL_INVALID: {ssl_note}" if ssl_note else ""
-            rows_to_append.append([
-                timestamp, site, host, str(status), f"{ms:.0f}", res, note
-            ])
+            is_ok = 200 <= status < 400
+            res = "OK" if is_ok else ("ERROR_404" if status == 404 else ("ERROR_5XX" if 500 <= status < 600 else "ERROR"))
+            if not is_ok:
+                note = f"SSL_INVALID: {ssl_note}" if ssl_note else ""
+                rows_to_append.append([
+                    timestamp, site, host, str(status), f"{ms:.0f}", res, note
+                ])
+                if status == 404:
+                    errors_404.append(_u)
+                elif 500 <= status < 600:
+                    errors_5xx.append((_u, status))
+                else:
+                    errors_other.append((_u, status))
 
     if ws:
         append_rows(ws, rows_to_append)
 
-    # Alerts
-    statuses = [s for (_u, _h, s, _ms, _e) in results]
-    status_non_none = [s for s in statuses if s is not None]
-
-    all_404 = bool(status_non_none) and all(s == 404 for s in status_non_none) and len(status_non_none) == len(results)
-    all_5xx = bool(status_non_none) and all(500 <= s < 600 for s in status_non_none) and len(status_non_none) == len(results)
-    count_404 = sum(1 for s in status_non_none if s == 404)
-    count_5xx = sum(1 for s in status_non_none if 500 <= s < 600)
-
-    # Immediate alerts per conditions
+    # Aggregated per-site alert after all pages are checked
     if cfg["alerts_enabled"]:
-        if all_404:
-            msg = (
-                f"🛑 [CRITICAL] Ошибка доступа ко всем страницам на лендинге\n"
-                f"Сайт: {site}\n"
-                f"Страниц с ошибкой 404: {count_404} из {len(results)}\n"
-                f"Время проверки: {timestamp}"
-            )
-            send_telegram_message(cfg["bot_token"], cfg["chat_id"], msg)
-        elif all_5xx:
-            msg = (
-                f"🛑 [CRITICAL] Сайт {site} недоступен\n"
-                f"Страниц с ошибкой 5хх: {count_5xx} из {len(results)}\n"
-                f"Время проверки: {timestamp}"
-            )
-            send_telegram_message(cfg["bot_token"], cfg["chat_id"], msg)
-        else:
-            for (_u, host, status, _ms, _e) in results:
-                if status == 404:
-                    text = (
-                        f"⚠️ [ALERT] Ошибка доступа к страницам\n"
-                        f"Сайт: {site}\n"
-                        f"Страница: {host}\n"
-                        f"Тип ошибки: 404\n"
-                        f"Время проверки: {timestamp}"
-                    )
-                    send_telegram_message(cfg["bot_token"], cfg["chat_id"], text)
-                elif status is not None and 500 <= status < 600:
-                    text = (
-                        f"🚨 [ALERT] Ошибка доступа к страницам\n"
-                        f"Сайт: {site}\n"
-                        f"Страница: {host}\n"
-                        f"Тип ошибки: {status}\n"
-                        f"Время проверки: {timestamp}"
-                    )
-                    send_telegram_message(cfg["bot_token"], cfg["chat_id"], text)
+        if ssl_invalid_flag or errors_404 or errors_5xx or errors_timeout or errors_network or errors_other:
+            parts = [
+                f"🚨 [ALERT] Ошибки на сайте {site}",
+            ]
+            if ssl_invalid_flag:
+                parts.append(f"SSL: {ssl_note}")
+            if errors_404:
+                parts.append("404 (" + str(len(errors_404)) + "):\n" + "\n".join(f"- {u}" for u in errors_404))
+            if errors_5xx:
+                parts.append("5xx (" + str(len(errors_5xx)) + "):\n" + "\n".join(f"- {u} [{code}]" for (u, code) in errors_5xx))
+            if errors_timeout:
+                parts.append("Таймауты (" + str(len(errors_timeout)) + "):\n" + "\n".join(f"- {u}" for u in errors_timeout))
+            if errors_network:
+                parts.append("Сетевые ошибки (" + str(len(errors_network)) + "):\n" + "\n".join(f"- {u}" for u in errors_network))
+            if errors_other:
+                parts.append("Прочие ошибки (" + str(len(errors_other)) + "):\n" + "\n".join(f"- {u} [{code}]" for (u, code) in errors_other))
+            parts.append(f"Время проверки: {timestamp}")
+            text = "\n\n".join(parts)
+            send_telegram_message(cfg["bot_token"], cfg["chat_id"], text)
 
     num_ok = sum(1 for (_u, _h, status, _ms, _e) in results if status is not None and 200 <= status < 400)
     # неуспехи учитываем только для 404 и 5xx (как по условиям алертов)
@@ -389,10 +373,7 @@ def main():
     if cfg["spreadsheet_id"] and cfg["gsa_json"] and os.path.exists(cfg["gsa_json"]):
         try:
             gc = get_gspread_client(cfg["gsa_json"])
-            sheet_title = (
-                sheet_name_for_run(cfg["timezone"]) if cfg.get("sheet_mode") == "per_run"
-                else sheet_name_for_today(cfg["timezone"])
-            )
+            sheet_title = "Лист 1"
             ws = ensure_worksheet(gc, cfg["spreadsheet_id"], sheet_title)
         except Exception as e:
             logger.exception("Failed to init Google Sheets client: %s", e)

@@ -28,7 +28,7 @@ def main():
 
     sh = gc.open_by_key(spreadsheet_id)
 
-    today_title = datetime.now().strftime("%Y-%m-%d")
+    today_title = "Лист 1"
     try:
         ws = sh.worksheet(today_title)
     except gspread.WorksheetNotFound:
