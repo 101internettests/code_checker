@@ -373,7 +373,7 @@ def main():
     if cfg["spreadsheet_id"] and cfg["gsa_json"] and os.path.exists(cfg["gsa_json"]):
         try:
             gc = get_gspread_client(cfg["gsa_json"])
-            sheet_title = "Лист 1"
+            sheet_title = "Лист1"
             ws = ensure_worksheet(gc, cfg["spreadsheet_id"], sheet_title)
         except Exception as e:
             logger.exception("Failed to init Google Sheets client: %s", e)
