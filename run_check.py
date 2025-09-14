@@ -343,8 +343,8 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
             send_telegram_message(cfg["bot_token"], cfg["chat_id"], text)
 
     num_ok = sum(1 for (_u, _h, status, _ms, _e) in results if status is not None and 200 <= status < 400)
-    # неуспехи учитываем только для 404 и 5xx (как по условиям алертов)
-    num_failed = sum(1 for (_u, _h, status, _ms, _e) in results if (status == 404) or (status is not None and 500 <= status < 600))
+    # Неуспехи учитываем для любых ошибок: таймауты/сеть (status=None) и любые non-2xx/3xx
+    num_failed = sum(1 for (_u, _h, status, _ms, _e) in results if (status is None) or not (status is not None and 200 <= status < 400))
     return {"num_pages": len(results), "num_ok": num_ok, "num_failed": num_failed, "ssl_invalid": ssl_invalid_flag}
 
 
@@ -415,7 +415,7 @@ def main():
     # Write stats.json if configured (aggregate per day, do not overwrite)
     if cfg.get("stats_file"):
         run_timestamp = now_local_str(cfg["timezone"])
-        # A run is successful if there were NO SSL issues and NO 404/5xx across all pages
+        # Run считается успешным только если нет SSL-проблем и нет каких-либо ошибок по страницам
         success_run = 1 if (int(ssl_issues_sites) == 0 and int(total_failed_pages) == 0) else 0
         failure_run = 1 - success_run
         run_date = datetime.now(ZoneInfo(cfg["timezone"]))\
