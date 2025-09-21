@@ -61,7 +61,9 @@ def load_config() -> dict:
         # отправлять ли сообщение об успешной проверке
         "success_alerts_enabled": os.getenv("SUCCESS_ALERTS_ENABLED", "true").lower() in {"1", "true", "yes"},
         # путь до stats.json (если задан, пишем сводку)
-        "stats_file": os.getenv("STATS_FILE", "").strip()
+        "stats_file": os.getenv("STATS_FILE", "").strip(),
+        # путь для хранения состояния алертов между прогонами
+        "alert_state_file": os.getenv("ALERT_STATE_FILE", "").strip()
     }
 
     missing = []
@@ -118,6 +120,49 @@ def extract_site_domain(url: str) -> Tuple[str, str]:
     registered_domain = f"{parsed.domain}.{parsed.suffix}" if parsed.suffix else parsed.domain
     host = url.split("//")[-1].split("/")[0]
     return registered_domain, host
+
+
+# --------------- Alert State (persistent) ---------------
+def _state_key(site: str, page: Optional[str], error_type: str) -> str:
+    # error_type: ssl_site | http_5xx | http_404 | timeout
+    page_part = page or ""
+    return f"{site}||{page_part}||{error_type}"
+
+
+def load_alert_state(path: str) -> Dict[str, dict]:
+    if not path:
+        return {}
+    try:
+        if not os.path.exists(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.error("Failed to load alert state %s: %s", path, e)
+        return {}
+
+
+def save_alert_state(path: str, state: Dict[str, dict]):
+    if not path:
+        return
+    try:
+        p = Path(path)
+        if p.parent and not p.parent.exists():
+            p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error("Failed to save alert state %s: %s", path, e)
+
+
+def should_notify(consecutive_runs: int, last_step: int) -> Tuple[bool, Optional[int]]:
+    # Notify on thresholds 1,4,12,50
+    thresholds = [1, 4, 12, 50]
+    for t in thresholds:
+        if consecutive_runs == t and last_step < t:
+            return True, t
+    return False, None
 
 
 # --------------- SSL Check ---------------
@@ -245,6 +290,7 @@ def group_urls_by_site(urls: List[str]) -> Dict[str, List[str]]:
 def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Client], ws: Optional[gspread.Worksheet]):
     tz = cfg["timezone"]
     timestamp = now_local_str(tz)
+    state = load_alert_state(cfg.get("alert_state_file", ""))
 
     # SSL check
     ssl_valid = True
@@ -275,6 +321,17 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
         logger.error("[%s] SSL invalid: %s", site, ssl_detail)
         ssl_note = ssl_detail or "сертификат недействителен"
         ssl_invalid_flag = True
+        # Запишем отдельную строку о проблеме SSL в хранилище (Google Sheets)
+        # чтобы было видно SSL-ошибки, а не только HTTP-коды
+        rows_to_append.append([
+            timestamp,  # timestamp
+            site,       # site
+            site,       # page (фиксируем базовый домен)
+            "",         # http_status
+            "",         # response_ms
+            "SERT_INVALID",  # result
+            ssl_note or ""
+        ])
 
     # HTTP checks
     results = []  # list of tuples (url, host, status, ms, err)
@@ -294,7 +351,7 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
             res = "TIMEOUT" if (err == "timeout") else "NETWORK_ERROR"
             note = err or ""
             if ssl_note:
-                note = (note + ("; " if note else "")) + f"SSL_INVALID: {ssl_note}"
+                note = (note + ("; " if note else "")) + f"SERT_INVALID: {ssl_note}"
             rows_to_append.append([
                 timestamp, site, host, "", f"{ms:.0f}", res, note
             ])
@@ -306,7 +363,7 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
             is_ok = 200 <= status < 400
             res = "OK" if is_ok else ("ERROR_404" if status == 404 else ("ERROR_5XX" if 500 <= status < 600 else "ERROR"))
             if not is_ok:
-                note = f"SSL_INVALID: {ssl_note}" if ssl_note else ""
+                note = f"SERT_INVALID: {ssl_note}" if ssl_note else ""
                 rows_to_append.append([
                     timestamp, site, host, str(status), f"{ms:.0f}", res, note
                 ])
@@ -320,31 +377,331 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
     if ws:
         append_rows(ws, rows_to_append)
 
-    # Aggregated per-site alert after all pages are checked
+    # ---------- Alerts & state logic (per URL) ----------
     if cfg["alerts_enabled"]:
-        if ssl_invalid_flag or errors_404 or errors_5xx or errors_timeout or errors_network or errors_other:
+        # SSL site-level
+        if ssl_invalid_flag:
+            key = _state_key(site, None, "ssl_site")
+            st = state.get(key, {"active": False, "consecutive_runs": 0, "first_seen": timestamp, "last_notified_step": 0})
+            st["consecutive_runs"] = int(st.get("consecutive_runs", 0)) + 1
+            st["active"] = True
+            notify, step = should_notify(st["consecutive_runs"], int(st.get("last_notified_step", 0)))
+            if notify:
+                parts = [
+                    "❌ [ALERT] Ошибка SSL сертификата",
+                    f"Сайт: {site}",
+                    f"Время проверки: {timestamp}"
+                ]
+                if step in (4, 12, 50):
+                    parts.append(f"Повторный прогон ошибки: {step} (ошибка все еще актуальна)")
+                    if step in (12, 50):
+                        parts.insert(2, f"Время первой фиксации ошибки: {st.get('first_seen', timestamp)}")
+                        parts.insert(3, f"Сколько прогонов подряд падает: {step}")
+                send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
+                st["last_notified_step"] = step
+            state[key] = st
+        else:
+            # SSL recovered
+            key = _state_key(site, None, "ssl_site")
+            st = state.get(key)
+            if st and st.get("active"):
+                parts = [
+                    "✅ [ALERT] Проблема с SSL сертификатом восстановлена🔒",
+                    f"Сайт: {site}",
+                    f"Время проверки: {timestamp}"
+                ]
+                send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
+                st["active"] = False
+                st["consecutive_runs"] = 0
+                st["last_notified_step"] = 0
+                state[key] = st
+
+        # Build per-URL error sets
+        pages_5xx = [(u, code) for (u, code) in errors_5xx]
+        pages_404 = [u for u in errors_404]
+        pages_timeout = [u for u in errors_timeout]
+
+        # ---------- Recovery detection before updating state ----------
+        current_5xx_set = {u for (u, _c) in pages_5xx}
+        current_404_set = set(pages_404)
+        current_timeout_set = set(pages_timeout)
+
+        prev_active_5xx = set()
+        prev_active_404 = set()
+        prev_active_timeout = set()
+        for k, st_old in list(state.items()):
+            try:
+                site_k, page_k, et_k = k.split("||", 2)
+            except ValueError:
+                continue
+            if site_k != site or not st_old or not st_old.get("active"):
+                continue
+            if et_k == "http_5xx":
+                prev_active_5xx.add(page_k)
+            elif et_k == "http_404":
+                prev_active_404.add(page_k)
+            elif et_k == "timeout":
+                prev_active_timeout.add(page_k)
+
+        recovered_5xx = sorted(list(prev_active_5xx - current_5xx_set)) if prev_active_5xx else []
+        recovered_404 = sorted(list(prev_active_404 - current_404_set)) if prev_active_404 else []
+        recovered_timeout = sorted(list(prev_active_timeout - current_timeout_set)) if prev_active_timeout else []
+
+        # Send recovery alerts per spec and clear state entries
+        # 5xx recoveries
+        if recovered_5xx:
+            if len(prev_active_5xx) == len(urls) and len(recovered_5xx) == len(urls):
+                parts = [
+                    "✅ [ALERT] Лендинг снова доступен",
+                    f"Все страницы сайта {site} вернули код 200",
+                    f"Время проверки: {timestamp}"
+                ]
+                send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
+            elif len(recovered_5xx) > 5:
+                parts = [
+                    "✅ [ALERT] Страницы снова доступны",
+                    f"Сайт: {site}",
+                    f"{len(recovered_5xx)} страниц сайта вернули код 200",
+                    f"Время проверки: {timestamp}"
+                ]
+                send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
+            else:
+                for url_ok in recovered_5xx:
+                    _s, host_ok = extract_site_domain(url_ok)
+                    parts = [
+                        "✅ [ALERT] Страница снова доступна",
+                        f"Сайт: {site}",
+                        f"Страница: {host_ok}",
+                        "Код: 200",
+                        f"Время проверки: {timestamp}"
+                    ]
+                    send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
+            # clear state
+            for url_ok in recovered_5xx:
+                key_del = _state_key(site, url_ok, "http_5xx")
+                if key_del in state:
+                    del state[key_del]
+
+        # 404 recoveries
+        if recovered_404:
+            if len(prev_active_404) == len(urls) and len(recovered_404) == len(urls):
+                parts = [
+                    "✅ [ALERT] Лендинг снова доступен",
+                    f"Все страницы сайта {site} вернули код 200",
+                    f"Время проверки: {timestamp}"
+                ]
+                send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
+            elif len(recovered_404) > 5:
+                parts = [
+                    "✅ [ALERT] Страницы снова доступны",
+                    f"Сайт: {site}",
+                    f"{len(recovered_404)} страниц сайта вернули код 200",
+                    f"Время проверки: {timestamp}"
+                ]
+                send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
+            else:
+                for url_ok in recovered_404:
+                    _s, host_ok = extract_site_domain(url_ok)
+                    parts = [
+                        "✅ [ALERT] Страница снова доступна",
+                        f"Сайт: {site}",
+                        f"Страница: {host_ok}",
+                        "Код: 200",
+                        f"Время проверки: {timestamp}"
+                    ]
+                    send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
+            # clear state
+            for url_ok in recovered_404:
+                key_del = _state_key(site, url_ok, "http_404")
+                if key_del in state:
+                    del state[key_del]
+
+        # Timeout recoveries (grouped list)
+        if recovered_timeout:
             parts = [
-                f"🚨 [ALERT] Ошибки на сайте {site}",
+                f"✅ [ALERT] Ожидание ответа страниц на сайте {site} вернулось к нормальным значениям",
+                "",
+                f"Страницы ({len(recovered_timeout)}):"
             ]
-            if ssl_invalid_flag:
-                parts.append(f"SSL: {ssl_note}")
-            if errors_404:
-                parts.append("404 (" + str(len(errors_404)) + "):\n" + "\n".join(f"- {u}" for u in errors_404))
-            if errors_5xx:
-                parts.append("5xx (" + str(len(errors_5xx)) + "):\n" + "\n".join(f"- {u} [{code}]" for (u, code) in errors_5xx))
-            if errors_timeout:
-                parts.append("Таймауты (" + str(len(errors_timeout)) + "):\n" + "\n".join(f"- {u}" for u in errors_timeout))
-            if errors_network:
-                parts.append("Сетевые ошибки (" + str(len(errors_network)) + "):\n" + "\n".join(f"- {u}" for u in errors_network))
-            if errors_other:
-                parts.append("Прочие ошибки (" + str(len(errors_other)) + "):\n" + "\n".join(f"- {u} [{code}]" for (u, code) in errors_other))
+            for url_ok in recovered_timeout:
+                parts.append(f"- {url_ok}")
+            parts.append("")
             parts.append(f"Время проверки: {timestamp}")
-            text = "\n\n".join(parts)
-            send_telegram_message(cfg["bot_token"], cfg["chat_id"], text)
+            send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
+            for url_ok in recovered_timeout:
+                key_del = _state_key(site, url_ok, "timeout")
+                if key_del in state:
+                    del state[key_del]
+
+        # Helper to update page state (without immediate send). We accumulate pages that hit threshold this run.
+        triggered_5xx: List[Tuple[str, str, int, str]] = []  # (url, code_label, step, first_seen)
+        triggered_404: List[Tuple[str, int, str]] = []  # (url, step, first_seen)
+        triggered_timeout: List[Tuple[str, int, str]] = []  # (url, step, first_seen)
+
+        def update_page_error(url: str, error_type: str, code_label: Optional[str] = None):
+            k = _state_key(site, url, error_type)
+            stp = state.get(k, {"active": False, "consecutive_runs": 0, "first_seen": timestamp, "last_notified_step": 0})
+            stp["consecutive_runs"] = int(stp.get("consecutive_runs", 0)) + 1
+            stp["active"] = True
+            stp["last_status_code"] = code_label
+            notify, step = should_notify(stp["consecutive_runs"], int(stp.get("last_notified_step", 0)))
+            if notify:
+                if error_type == "http_5xx":
+                    triggered_5xx.append((url, code_label or "5xx", step, stp.get('first_seen', timestamp)))
+                elif error_type == "http_404":
+                    triggered_404.append((url, step, stp.get('first_seen', timestamp)))
+                elif error_type == "timeout":
+                    triggered_timeout.append((url, step, stp.get('first_seen', timestamp)))
+                stp["last_notified_step"] = step
+            state[k] = stp
+
+        # Update per-page errors (per-URL accounting)
+        for u, code in pages_5xx:
+            update_page_error(u, "http_5xx", code_label=str(code))
+        for u in pages_404:
+            update_page_error(u, "http_404")
+        for u in pages_timeout:
+            update_page_error(u, "timeout")
+
+        # Group-level summaries when count > 5 or all pages affected (built on per-URL states)
+        num_5xx = len(pages_5xx)
+        num_404 = len(pages_404)
+        total_site_pages = len(urls)
+        all_5xx = (num_5xx == total_site_pages and total_site_pages > 0)
+        all_404 = (num_404 == total_site_pages and total_site_pages > 0)
+
+        # Trigger group messages only if any page just hit a threshold this run
+        def any_page_hit_threshold(pages: List[str], error_type: str) -> bool:
+            for url in pages:
+                k = _state_key(site, url, error_type)
+                stl = state.get(k)
+                if not stl:
+                    continue
+                last_step = int(stl.get("last_notified_step", 0))
+                consec = int(stl.get("consecutive_runs", 0))
+                want, _ = should_notify(consec, last_step)
+                if want:
+                    return True
+            return False
+
+        # 5xx group messages
+        if num_5xx > 5 or all_5xx:
+            if triggered_5xx:
+                if all_5xx:
+                    parts = [
+                        f"[CRITICAL] Сайт {site} недоступен",
+                        "Все страницы вернули ошибку 5хх",
+                        f"Время проверки: {timestamp}"
+                    ]
+                else:
+                    parts = [
+                        "❌ [ALERT] Ошибка доступа к страницам",
+                        f"Сайт: {site}",
+                        f"{num_5xx} страниц сайта вернули ошибку 5хх",
+                        f"Время проверки: {timestamp}"
+                    ]
+                rep_steps = [s for (_u, _c, s, _fs) in triggered_5xx if s in (4, 12, 50)]
+                if rep_steps:
+                    stepv = rep_steps[0]
+                    parts.append(f"Повторный прогон ошибки: {stepv} (ошибка все еще актуальна)")
+                    if stepv in (12, 50):
+                        firsts = [fs for (_u, _c, s, fs) in triggered_5xx if s == stepv and fs]
+                        first_seen_val = firsts[0] if firsts else timestamp
+                        parts.insert(2, f"Время первой фиксации ошибки: {first_seen_val}")
+                        parts.insert(3, f"Сколько прогонов подряд падает: {stepv}")
+                send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
+        elif 0 < num_5xx <= 5:
+            if triggered_5xx:
+                # Send one message per page as per spec
+                for (url, code_label, step, first_seen_val) in triggered_5xx:
+                    _site, host = extract_site_domain(url)
+                    parts = [
+                        "❌ [ALERT] Ошибка доступа к страницам",
+                        f"Сайт: {site}",
+                        f"Страница: {host}",
+                        f"Тип ошибки: {code_label}",
+                        f"Время проверки: {timestamp}"
+                    ]
+                    if step in (4, 12, 50):
+                        parts.append(f"Повторный прогон ошибки: {step} (ошибка все еще актуальна)")
+                        if step in (12, 50):
+                            parts.insert(2, f"Время первой фиксации ошибки: {first_seen_val}")
+                            parts.insert(3, f"Сколько прогонов подряд падает: {step}")
+                    send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
+
+        # 404 group messages
+        if num_404 > 5 or all_404:
+            if triggered_404:
+                if all_404:
+                    parts = [
+                        "[CRITICAL] Ошибка доступа ко всем страницам на лендинге",
+                        f"Все страницы сайта {site} вернули ошибку 404",
+                        f"Время проверки: {timestamp}"
+                    ]
+                else:
+                    parts = [
+                        "❌ [ALERT] Ошибка доступа к страницам",
+                        f"Сайт: {site}",
+                        f"{num_404} страниц сайта вернули ошибку 404",
+                        f"Время проверки: {timestamp}"
+                    ]
+                rep_steps = [s for (_u, s, _fs) in triggered_404 if s in (4, 12, 50)]
+                if rep_steps:
+                    stepv = rep_steps[0]
+                    parts.append(f"Повторный прогон ошибки: {stepv} (ошибка все еще актуальна)")
+                    if stepv in (12, 50):
+                        firsts = [fs for (_u, s, fs) in triggered_404 if s == stepv and fs]
+                        first_seen_val = firsts[0] if firsts else timestamp
+                        parts.insert(2, f"Время первой фиксации ошибки: {first_seen_val}")
+                        parts.insert(3, f"Сколько прогонов подряд падает: {stepv}")
+                send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
+        elif 0 < num_404 <= 5:
+            if triggered_404:
+                for (url, step, first_seen_val) in triggered_404:
+                    _site, host = extract_site_domain(url)
+                    parts = [
+                        "❌ [ALERT] Ошибка доступа к страницам",
+                        f"Сайт: {site}",
+                        f"Страница: {host}",
+                        "Тип ошибки: 404",
+                        f"Время проверки: {timestamp}"
+                    ]
+                    if step in (4, 12, 50):
+                        parts.append(f"Повторный прогон ошибки: {step} (ошибка все еще актуальна)")
+                        if step in (12, 50):
+                            parts.insert(2, f"Время первой фиксации ошибки: {first_seen_val}")
+                            parts.insert(3, f"Сколько прогонов подряд падает: {step}")
+                    send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
+
+        # Timeouts grouped
+        if triggered_timeout:
+            parts = [
+                f"❌ [ALERT] Ошибки на сайте {site}",
+                "",
+                f"Таймауты ({len(triggered_timeout)}):"
+            ]
+            for (url, _step, _fs) in triggered_timeout:
+                parts.append(f"- {url}")
+            rep_steps = [s for (_u, s, _fs) in triggered_timeout if s in (4, 12, 50)]
+            if rep_steps:
+                stepv = rep_steps[0]
+                parts.append("")
+                parts.append(f"Повторный прогон ошибки: {stepv} (ошибка все еще актуальна)")
+                if stepv in (12, 50):
+                    firsts = [fs for (_u, s, fs) in triggered_timeout if s == stepv and fs]
+                    first_seen_val = firsts[0] if firsts else timestamp
+                    parts.insert(2, f"Время первой фиксации ошибки: {first_seen_val}")
+                    parts.insert(3, f"Сколько прогонов подряд падает: {stepv}")
+            parts.append("")
+            parts.append(f"Время проверки: {timestamp}")
+            send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
+
+    # Save alert state (after all updates and notifications)
+    save_alert_state(cfg.get("alert_state_file", ""), state)
 
     num_ok = sum(1 for (_u, _h, status, _ms, _e) in results if status is not None and 200 <= status < 400)
-    # Неуспехи учитываем для любых ошибок: таймауты/сеть (status=None) и любые non-2xx/3xx
-    num_failed = sum(1 for (_u, _h, status, _ms, _e) in results if (status is None) or not (status is not None and 200 <= status < 400))
+    # неуспехи учитываем только для 404 и 5xx (как по условиям алертов)
+    num_failed = sum(1 for (_u, _h, status, _ms, _e) in results if (status == 404) or (status is not None and 500 <= status < 600))
     return {"num_pages": len(results), "num_ok": num_ok, "num_failed": num_failed, "ssl_invalid": ssl_invalid_flag}
 
 
@@ -366,6 +723,13 @@ def main():
         return
 
     groups = group_urls_by_site(urls)
+    # Ensure alert state file exists or create empty
+    if cfg.get("alert_state_file"):
+        st_path = Path(cfg["alert_state_file"]).expanduser()
+        if st_path.parent and not st_path.parent.exists():
+            st_path.parent.mkdir(parents=True, exist_ok=True)
+        if not st_path.exists():
+            save_alert_state(str(st_path), {})
     logger.info("Loaded %d URLs across %d sites", len(urls), len(groups))
 
     gc = None
@@ -399,8 +763,8 @@ def main():
         except Exception as e:
             logger.exception("Unexpected error while processing site %s: %s", site, e)
 
-    # Success after whole run if no errors
-    if cfg["alerts_enabled"] and cfg.get("success_alerts_enabled", True):
+    # Success after whole run if no errors (controlled only by SUCCESS_ALERTS_ENABLED)
+    if cfg.get("success_alerts_enabled", True):
         if total_pages > 0 and total_ok == total_pages:
             run_timestamp = now_local_str(cfg["timezone"])
             duration = time.perf_counter() - run_start
@@ -415,7 +779,7 @@ def main():
     # Write stats.json if configured (aggregate per day, do not overwrite)
     if cfg.get("stats_file"):
         run_timestamp = now_local_str(cfg["timezone"])
-        # Run считается успешным только если нет SSL-проблем и нет каких-либо ошибок по страницам
+        # A run is successful if there were NO SSL issues and NO 404/5xx across all pages
         success_run = 1 if (int(ssl_issues_sites) == 0 and int(total_failed_pages) == 0) else 0
         failure_run = 1 - success_run
         run_date = datetime.now(ZoneInfo(cfg["timezone"]))\
