@@ -33,10 +33,10 @@ def main():
         ws = sh.worksheet(today_title)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=today_title, rows=1, cols=20)
-        ws.append_row(["timestamp", "site", "page", "http_status", "response_ms", "result", "notes"], value_input_option="RAW")
+        ws.append_row(["timestamp", "site", "http_full", "http_status", "response_ms", "result", "notes"], value_input_option="RAW")
 
     now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-    ws.append_row([now_str, "TEST", "test.example.com", "", "", "TEST_WRITE", "ping"], value_input_option="RAW")
+    ws.append_row([now_str, "TEST", "https://test.example.com/page", "", "", "TEST_WRITE", "ping"], value_input_option="RAW")
 
     print(f"OK: test row appended to sheet '{today_title}' in spreadsheet {spreadsheet_id}")
 
