@@ -224,6 +224,24 @@ def ensure_worksheet(gc: gspread.Client, spreadsheet_id: str, title: str) -> gsp
     sh = gc.open_by_key(spreadsheet_id)
     try:
         ws = sh.worksheet(title)
+        # Ensure header has response_time column in the desired position
+        try:
+            desired_header = [
+                "timestamp",
+                "site",
+                "http_full",
+                "http_status",
+                "response_ms",
+                "response_time",
+                "result",
+                "notes"
+            ]
+            current = ws.row_values(1)
+            current_norm = [c.strip() for c in current]
+            if current_norm[:len(desired_header)] != desired_header:
+                ws.update('A1:H1', [desired_header])
+        except Exception:
+            pass
         return ws
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=title, rows=1, cols=20)
@@ -233,6 +251,7 @@ def ensure_worksheet(gc: gspread.Client, spreadsheet_id: str, title: str) -> gsp
             "http_full",
             "http_status",
             "response_ms",
+            "response_time",
             "result",
             "notes"
         ]
@@ -329,6 +348,7 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
             site,       # http_full (для SSL-ошибки фиксируем базовый домен)
             "",         # http_status
             "",         # response_ms
+            "",         # response_time (sec)
             "SERT_INVALID",  # result
             ssl_note or ""
         ])
@@ -353,7 +373,7 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
             if ssl_note:
                 note = (note + ("; " if note else "")) + f"SERT_INVALID: {ssl_note}"
             rows_to_append.append([
-                timestamp, site, _u, "", f"{ms:.0f}", res, note
+                timestamp, site, _u, "", f"{ms:.0f}", f"{ms/1000.0:.3f}", res, note
             ])
             if err == "timeout":
                 errors_timeout.append(_u)
@@ -365,7 +385,7 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
             if not is_ok:
                 note = f"SERT_INVALID: {ssl_note}" if ssl_note else ""
                 rows_to_append.append([
-                    timestamp, site, _u, str(status), f"{ms:.0f}", res, note
+                    timestamp, site, _u, str(status), f"{ms:.0f}", f"{ms/1000.0:.3f}", res, note
                 ])
                 if status == 404:
                     errors_404.append(_u)
