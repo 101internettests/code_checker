@@ -322,9 +322,29 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                 ssl_valid, ssl_detail = False, detail
                 break
     else:
-        ok, detail = check_ssl_valid(site)
-        if not ok:
-            ssl_valid, ssl_detail = False, detail
+        # Base mode: try apex and www-variant; consider valid if any passes
+        domains_to_try = [site]
+        if site.startswith("www."):
+            apex = site[4:]
+            if apex:
+                domains_to_try.append(apex)
+        else:
+            domains_to_try.append(f"www.{site}")
+
+        check_results: List[Tuple[str, bool, Optional[str]]] = []
+        ssl_valid = False
+        for dom in domains_to_try:
+            ok, detail = check_ssl_valid(dom)
+            check_results.append((dom, ok, detail))
+            if ok:
+                ssl_valid = True
+                break
+        if not ssl_valid:
+            # Aggregate details for both attempts to aid troubleshooting
+            details_joined = "; ".join([
+                f"{d}: {det or 'unknown error'}" for (d, ok, det) in check_results if not ok
+            ])
+            ssl_detail = details_joined or "SSL: сертификат недействителен"
 
     rows_to_append: List[List[str]] = []
     errors_404: List[str] = []
