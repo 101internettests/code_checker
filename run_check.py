@@ -1,4 +1,5 @@
 import os
+import random
 import ssl
 import socket
 import time
@@ -63,8 +64,38 @@ def load_config() -> dict:
         # путь до stats.json (если задан, пишем сводку)
         "stats_file": os.getenv("STATS_FILE", "").strip(),
         # путь для хранения состояния алертов между прогонами
-        "alert_state_file": os.getenv("ALERT_STATE_FILE", "").strip()
+        "alert_state_file": os.getenv("ALERT_STATE_FILE", "").strip(),
+        # Proxy settings: enable and provide comma/semicolon/newline-separated list of full proxy URLs
+        # Example item: http://USER:PASS@185.126.86.225:8000
+        "proxies_enabled": os.getenv("PROXIES_ENABLED", "false").lower() in {"1", "true", "yes"},
+        "proxy_urls_raw": os.getenv("PROXY_URLS", ""),
+        # Percentage (0..100) of requests to send directly (without proxy) when proxies are enabled
+        "proxy_direct_percent": os.getenv("PROXY_DIRECT_PERCENT", "0")
     }
+
+    # Normalize proxy URLs list
+    raw_list = config.get("proxy_urls_raw", "")
+    if raw_list:
+        # split by common separators and strip blanks
+        parts = []
+        for sep in ["\n", ";", ",", " "]:
+            if sep in raw_list:
+                raw_list = raw_list.replace(sep, "\n")
+        parts = [p.strip() for p in raw_list.split("\n") if p.strip()]
+    else:
+        parts = []
+    config["proxy_urls"] = parts
+
+    # Normalize direct percent
+    try:
+        direct_percent = int(str(config.get("proxy_direct_percent", "0")).strip())
+    except Exception:
+        direct_percent = 0
+    if direct_percent < 0:
+        direct_percent = 0
+    if direct_percent > 100:
+        direct_percent = 100
+    config["proxy_direct_percent"] = direct_percent
 
     missing = []
     for key in ["urls_file", "spreadsheet_id", "gsa_json"]:
@@ -120,6 +151,31 @@ def extract_site_domain(url: str) -> Tuple[str, str]:
     registered_domain = f"{parsed.domain}.{parsed.suffix}" if parsed.suffix else parsed.domain
     host = url.split("//")[-1].split("/")[0]
     return registered_domain, host
+
+
+def _select_random_proxy(proxy_urls: List[str]) -> Optional[Dict[str, str]]:
+    if not proxy_urls:
+        return None
+    proxy_url = random.choice(proxy_urls)
+    # Provide same proxy for http and https schemes
+    return {"http": proxy_url, "https": proxy_url}
+
+
+def _proxy_label(proxy_url: str) -> str:
+    try:
+        # Hide credentials; show only host:port
+        hostport = proxy_url.split("@")[ -1 ]
+        return hostport
+    except Exception:
+        return "proxy"
+
+
+def _should_use_direct(direct_percent: int) -> bool:
+    if direct_percent <= 0:
+        return False
+    if direct_percent >= 100:
+        return True
+    return (random.random() * 100.0) < float(direct_percent)
 
 
 # --------------- Alert State (persistent) ---------------
@@ -192,14 +248,14 @@ def check_ssl_valid(domain: str, timeout: int = 10) -> Tuple[bool, Optional[str]
 
 
 # --------------- HTTP Request ---------------
-def request_with_timing(url: str, timeout: int, verify_ssl: bool = True) -> Tuple[Optional[int], float, Optional[str]]:
+def request_with_timing(url: str, timeout: int, verify_ssl: bool = True, proxies: Optional[Dict[str, str]] = None) -> Tuple[Optional[int], float, Optional[str]]:
     """
     Returns (status_code, response_ms, error_message)
     status_code is None on network/timeout error
     """
     start = time.perf_counter()
     try:
-        resp = requests.get(url, timeout=timeout, allow_redirects=True, verify=verify_ssl)
+        resp = requests.get(url, timeout=timeout, allow_redirects=True, verify=verify_ssl, proxies=proxies)
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         return resp.status_code, elapsed_ms, None
     except requests.Timeout:
@@ -377,10 +433,23 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
     results = []  # list of tuples (url, host, status, ms, err)
     for u in urls:
         # If SSL is invalid, bypass verification to still get HTTP status codes
+        proxies = None
+        if cfg.get("proxies_enabled") and cfg.get("proxy_urls"):
+            if _should_use_direct(int(cfg.get("proxy_direct_percent", 0))):
+                logger.info("Using direct connection for %s", u)
+            else:
+                proxies = _select_random_proxy(cfg["proxy_urls"]) or None
+                if proxies and isinstance(proxies, dict) and proxies.get("http"):
+                    try:
+                        label = _proxy_label(proxies.get("http", ""))
+                        logger.info("Using proxy %s for %s", label, u)
+                    except Exception:
+                        pass
         status, ms, err = request_with_timing(
             u,
             cfg["timeout_seconds"],
-            verify_ssl=ssl_valid  # True normally, False if SSL invalid
+            verify_ssl=ssl_valid,  # True normally, False if SSL invalid
+            proxies=proxies
         )
         _, host = extract_site_domain(u)
         results.append((u, host, status, ms, err))
