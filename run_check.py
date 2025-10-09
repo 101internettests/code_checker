@@ -222,7 +222,7 @@ def should_notify(consecutive_runs: int, last_step: int) -> Tuple[bool, Optional
 
 
 # --------------- SSL Check ---------------
-def check_ssl_valid(domain: str, timeout: int = 10) -> Tuple[bool, Optional[str]]:
+def check_ssl_valid(domain: str, timeout: int = 30) -> Tuple[bool, Optional[str]]:
     """Check SSL certificate validity for a domain on 443.
     Returns (is_valid, detail_message).
     """
