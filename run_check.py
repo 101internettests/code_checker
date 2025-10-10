@@ -23,7 +23,7 @@ requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 
 
 # --------------- Configuration ---------------
-DEFAULT_TIMEOUT_SECONDS = 10
+DEFAULT_TIMEOUT_SECONDS = 16
 DEFAULT_TZ = os.environ.get("TZ", "Europe/Moscow")
 
 
