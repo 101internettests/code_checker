@@ -872,9 +872,9 @@ def main():
         except Exception as e:
             logger.exception("Unexpected error while processing site %s: %s", site, e)
 
-    # Success after whole run if no errors (controlled only by SUCCESS_ALERTS_ENABLED)
+    # Success after whole run if no SSL проблем и нет 404/5xx (как и при записи в stats)
     if cfg.get("success_alerts_enabled", True):
-        if total_pages > 0 and total_ok == total_pages:
+        if total_pages > 0 and ssl_issues_sites == 0 and total_failed_pages == 0:
             run_timestamp = now_local_str(cfg["timezone"])
             duration = time.perf_counter() - run_start
             ok_msg = (
