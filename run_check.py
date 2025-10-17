@@ -445,12 +445,41 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                         logger.info("Using proxy %s for %s", label, u)
                     except Exception:
                         pass
+
         status, ms, err = request_with_timing(
             u,
             cfg["timeout_seconds"],
             verify_ssl=ssl_valid,  # True normally, False if SSL invalid
             proxies=proxies
         )
+
+        # If got an error (timeout, network, or non-2xx/3xx), confirm via proxy from PROXY_URLS
+        def _is_ok(sc: Optional[int]) -> bool:
+            return sc is not None and 200 <= sc < 400
+
+        if not _is_ok(status) and cfg.get("proxy_urls"):
+            confirm_proxies = _select_random_proxy(cfg["proxy_urls"]) or None
+            if confirm_proxies and isinstance(confirm_proxies, dict) and confirm_proxies.get("http"):
+                try:
+                    label2 = _proxy_label(confirm_proxies.get("http", ""))
+                    logger.info("Confirm via proxy %s for %s", label2, u)
+                except Exception:
+                    pass
+            c_status, c_ms, c_err = request_with_timing(
+                u,
+                cfg["timeout_seconds"],
+                verify_ssl=ssl_valid,
+                proxies=confirm_proxies
+            )
+            if _is_ok(c_status):
+                # Suppress error – treat as success
+                status, ms, err = c_status, c_ms, c_err
+                logger.info("Suppressed error after confirm via proxy for %s", u)
+            else:
+                # Error confirmed – keep confirmed result
+                status, ms, err = c_status, c_ms, c_err
+                logger.info("Error confirmed after confirm via proxy for %s", u)
+
         _, host = extract_site_domain(u)
         results.append((u, host, status, ms, err))
 
@@ -872,9 +901,9 @@ def main():
         except Exception as e:
             logger.exception("Unexpected error while processing site %s: %s", site, e)
 
-    # Success after whole run if no SSL проблем и нет 404/5xx (как и при записи в stats)
+    # Success after whole run if no errors (controlled only by SUCCESS_ALERTS_ENABLED)
     if cfg.get("success_alerts_enabled", True):
-        if total_pages > 0 and ssl_issues_sites == 0 and total_failed_pages == 0:
+        if total_pages > 0 and total_ok == total_pages:
             run_timestamp = now_local_str(cfg["timezone"])
             duration = time.perf_counter() - run_start
             ok_msg = (
