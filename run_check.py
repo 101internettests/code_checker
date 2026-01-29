@@ -70,10 +70,7 @@ def load_config() -> dict:
         "proxies_enabled": os.getenv("PROXIES_ENABLED", "false").lower() in {"1", "true", "yes"},
         "proxy_urls_raw": os.getenv("PROXY_URLS", ""),
         # Percentage (0..100) of requests to send directly (without proxy) when proxies are enabled
-        "proxy_direct_percent": os.getenv("PROXY_DIRECT_PERCENT", "0"),
-        # Content validation: treat 200 responses as errors if body contains any of these substrings
-        # Example: "Fatal error;Uncaught Exception"
-        "content_error_substrings_raw": os.getenv("CONTENT_ERROR_SUBSTRINGS", "Fatal error")
+        "proxy_direct_percent": os.getenv("PROXY_DIRECT_PERCENT", "0")
     }
 
     # Normalize proxy URLs list
@@ -99,18 +96,6 @@ def load_config() -> dict:
     if direct_percent > 100:
         direct_percent = 100
     config["proxy_direct_percent"] = direct_percent
-
-    # Parse content error substrings list
-    raw_content = str(config.get("content_error_substrings_raw", "")).strip()
-    if raw_content:
-        tmp = raw_content
-        for sep in ["\n", ";", ","]:
-            if sep in tmp:
-                tmp = tmp.replace(sep, "\n")
-        content_list = [p.strip() for p in tmp.split("\n") if p.strip()]
-    else:
-        content_list = []
-    config["content_error_substrings"] = content_list
 
     missing = []
     for key in ["urls_file", "spreadsheet_id", "gsa_json"]:
@@ -263,28 +248,22 @@ def check_ssl_valid(domain: str, timeout: int = 30) -> Tuple[bool, Optional[str]
 
 
 # --------------- HTTP Request ---------------
-def request_with_timing(url: str, timeout: int, verify_ssl: bool = True, proxies: Optional[Dict[str, str]] = None) -> Tuple[Optional[int], float, Optional[str], Optional[str]]:
+def request_with_timing(url: str, timeout: int, verify_ssl: bool = True, proxies: Optional[Dict[str, str]] = None) -> Tuple[Optional[int], float, Optional[str]]:
     """
-    Returns (status_code, response_ms, error_message, text_snippet)
+    Returns (status_code, response_ms, error_message)
     status_code is None on network/timeout error
     """
     start = time.perf_counter()
     try:
         resp = requests.get(url, timeout=timeout, allow_redirects=True, verify=verify_ssl, proxies=proxies)
         elapsed_ms = (time.perf_counter() - start) * 1000.0
-        # Limit response text to avoid huge memory usage
-        text_snippet: Optional[str]
-        try:
-            text_snippet = resp.text[:8192]
-        except Exception:
-            text_snippet = None
-        return resp.status_code, elapsed_ms, None, text_snippet
+        return resp.status_code, elapsed_ms, None
     except requests.Timeout:
         elapsed_ms = (time.perf_counter() - start) * 1000.0
-        return None, elapsed_ms, "timeout", None
+        return None, elapsed_ms, "timeout"
     except requests.RequestException as e:
         elapsed_ms = (time.perf_counter() - start) * 1000.0
-        return None, elapsed_ms, str(e), None
+        return None, elapsed_ms, str(e)
 
 
 # --------------- Google Sheets ---------------
@@ -387,7 +366,6 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
     tz = cfg["timezone"]
     timestamp = now_local_str(tz)
     state = load_alert_state(cfg.get("alert_state_file", ""))
-    content_error_substrings = [s.lower() for s in cfg.get("content_error_substrings", [])]
 
     # SSL check
     ssl_valid = True
@@ -430,7 +408,6 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
     errors_timeout: List[str] = []
     errors_network: List[str] = []
     errors_other: List[Tuple[str, int]] = []
-    errors_content: List[Tuple[str, str]] = []  # (url, content_note)
 
     # If SSL invalid, alert but continue to perform HTTP checks; mark rows with note
     ssl_note: Optional[str] = None
@@ -453,7 +430,7 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
         ])
 
     # HTTP checks
-    results = []  # list of tuples (url, host, status, ms, err, content_error, content_note)
+    results = []  # list of tuples (url, host, status, ms, err)
     for u in urls:
         # If SSL is invalid, bypass verification to still get HTTP status codes
         proxies = None
@@ -469,7 +446,7 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                     except Exception:
                         pass
 
-        status, ms, err, body_text = request_with_timing(
+        status, ms, err = request_with_timing(
             u,
             cfg["timeout_seconds"],
             verify_ssl=ssl_valid,  # True normally, False if SSL invalid
@@ -488,7 +465,7 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                     logger.info("Confirm via proxy %s for %s", label2, u)
                 except Exception:
                     pass
-            c_status, c_ms, c_err, c_body_text = request_with_timing(
+            c_status, c_ms, c_err = request_with_timing(
                 u,
                 cfg["timeout_seconds"],
                 verify_ssl=ssl_valid,
@@ -496,30 +473,18 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
             )
             if _is_ok(c_status):
                 # Suppress error – treat as success
-                status, ms, err, body_text = c_status, c_ms, c_err, c_body_text
+                status, ms, err = c_status, c_ms, c_err
                 logger.info("Suppressed error after confirm via proxy for %s", u)
             else:
                 # Error confirmed – keep confirmed result
-                status, ms, err, body_text = c_status, c_ms, c_err, c_body_text
+                status, ms, err = c_status, c_ms, c_err
                 logger.info("Error confirmed after confirm via proxy for %s", u)
 
         _, host = extract_site_domain(u)
-        # Content validation for successful statuses
-        content_error = False
-        content_note = None
-        if status is not None and 200 <= status < 400 and body_text and content_error_substrings:
-            bt_lower = body_text.lower()
-            matched = [s for s in content_error_substrings if s in bt_lower]
-            if matched:
-                content_error = True
-                if len(matched) == 1:
-                    content_note = f"CONTENT_ERROR: contains '{matched[0]}'"
-                else:
-                    content_note = f"CONTENT_ERROR: contains {', '.join([repr(m) for m in matched])}"
-        results.append((u, host, status, ms, err, content_error, content_note or ""))
+        results.append((u, host, status, ms, err))
 
     # Append to sheet (only errors) and collect aggregation
-    for (_u, host, status, ms, err, content_error, content_note) in results:
+    for (_u, host, status, ms, err) in results:
         if status is None:
             res = "TIMEOUT" if (err == "timeout") else "NETWORK_ERROR"
             note = err or ""
@@ -533,18 +498,10 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
             else:
                 errors_network.append(_u)
         else:
-            is_ok = (200 <= status < 400) and (not content_error)
-            if not is_ok and content_error and (200 <= status < 400):
-                res = "ERROR_CONTENT"
-            else:
-                res = "OK" if is_ok else ("ERROR_404" if status == 404 else ("ERROR_5XX" if 500 <= status < 600 else "ERROR"))
+            is_ok = 200 <= status < 400
+            res = "OK" if is_ok else ("ERROR_404" if status == 404 else ("ERROR_5XX" if 500 <= status < 600 else "ERROR"))
             if not is_ok:
-                note_parts = []
-                if ssl_note:
-                    note_parts.append(f"SERT_INVALID: {ssl_note}")
-                if content_error and content_note:
-                    note_parts.append(content_note)
-                note = "; ".join(note_parts)
+                note = f"SERT_INVALID: {ssl_note}" if ssl_note else ""
                 rows_to_append.append([
                     timestamp, site, _u, str(status), f"{ms:.0f}", f"{ms/1000.0:.3f}", res, note
                 ])
@@ -553,10 +510,7 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                 elif 500 <= status < 600:
                     errors_5xx.append((_u, status))
                 else:
-                    if content_error:
-                        errors_content.append((_u, content_note or "CONTENT_ERROR"))
-                    else:
-                        errors_other.append((_u, status))
+                    errors_other.append((_u, status))
 
     if ws:
         append_rows(ws, rows_to_append)
@@ -604,7 +558,6 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
         pages_5xx = [(u, code) for (u, code) in errors_5xx]
         pages_404 = [u for u in errors_404]
         pages_timeout = [u for u in errors_timeout]
-        pages_content = [(u, note) for (u, note) in errors_content]
 
         # ---------- Recovery detection before updating state ----------
         current_5xx_set = {u for (u, _c) in pages_5xx}
@@ -614,7 +567,6 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
         prev_active_5xx = set()
         prev_active_404 = set()
         prev_active_timeout = set()
-        prev_active_content = set()
         for k, st_old in list(state.items()):
             try:
                 site_k, page_k, et_k = k.split("||", 2)
@@ -628,14 +580,10 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                 prev_active_404.add(page_k)
             elif et_k == "timeout":
                 prev_active_timeout.add(page_k)
-            elif et_k == "content_error":
-                prev_active_content.add(page_k)
 
         recovered_5xx = sorted(list(prev_active_5xx - current_5xx_set)) if prev_active_5xx else []
         recovered_404 = sorted(list(prev_active_404 - current_404_set)) if prev_active_404 else []
         recovered_timeout = sorted(list(prev_active_timeout - current_timeout_set)) if prev_active_timeout else []
-        current_content_set = {u for (u, _n) in pages_content}
-        recovered_content = sorted(list(prev_active_content - current_content_set)) if prev_active_content else []
 
         # Send recovery alerts per spec and clear state entries
         # 5xx recoveries
@@ -723,36 +671,10 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                 if key_del in state:
                     del state[key_del]
 
-        # Content error recoveries
-        if recovered_content:
-            if len(prev_active_content) > 5 and len(recovered_content) > 5:
-                parts = [
-                    "✅ [ALERT] Проблемы контента устранены",
-                    f"Сайт: {site}",
-                    f"{len(recovered_content)} страниц больше не содержат запрещённый текст",
-                    f"Время проверки: {timestamp}"
-                ]
-                send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
-            else:
-                for url_ok in recovered_content:
-                    _s, host_ok = extract_site_domain(url_ok)
-                    parts = [
-                        "✅ [ALERT] Проблема контента устранена",
-                        f"Сайт: {site}",
-                        f"Страница: {host_ok}",
-                        f"Время проверки: {timestamp}"
-                    ]
-                    send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
-            for url_ok in recovered_content:
-                key_del = _state_key(site, url_ok, "content_error")
-                if key_del in state:
-                    del state[key_del]
-
         # Helper to update page state (without immediate send). We accumulate pages that hit threshold this run.
         triggered_5xx: List[Tuple[str, str, int, str]] = []  # (url, code_label, step, first_seen)
         triggered_404: List[Tuple[str, int, str]] = []  # (url, step, first_seen)
         triggered_timeout: List[Tuple[str, int, str]] = []  # (url, step, first_seen)
-        triggered_content: List[Tuple[str, str, int, str]] = []  # (url, note, step, first_seen)
 
         def update_page_error(url: str, error_type: str, code_label: Optional[str] = None):
             k = _state_key(site, url, error_type)
@@ -768,8 +690,6 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                     triggered_404.append((url, step, stp.get('first_seen', timestamp)))
                 elif error_type == "timeout":
                     triggered_timeout.append((url, step, stp.get('first_seen', timestamp)))
-                elif error_type == "content_error":
-                    triggered_content.append((url, code_label or "CONTENT_ERROR", step, stp.get('first_seen', timestamp)))
                 stp["last_notified_step"] = step
             state[k] = stp
 
@@ -780,8 +700,6 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
             update_page_error(u, "http_404")
         for u in pages_timeout:
             update_page_error(u, "timeout")
-        for (u, note) in pages_content:
-            update_page_error(u, "content_error", code_label=note)
 
         # Group-level summaries when count > 5 or all pages affected (built on per-URL states)
         num_5xx = len(pages_5xx)
@@ -893,38 +811,6 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                             parts.insert(3, f"Сколько прогонов подряд падает: {step}")
                     send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
 
-        # Content errors grouped / per page
-        num_content = len(pages_content)
-        if num_content > 5:
-            if triggered_content:
-                parts = [
-                    "❌ [ALERT] Ошибка контента на страницах",
-                    f"Сайт: {site}",
-                    f"{num_content} страниц содержат запрещённый текст",
-                    f"Время проверки: {timestamp}"
-                ]
-                rep_steps = [s for (_u, _note, s, _fs) in triggered_content if s in (4, 12, 50)]
-                if rep_steps:
-                    stepv = rep_steps[0]
-                    parts.append(f"Повторный прогон ошибки: {stepv} (ошибка все еще актуальна)")
-                send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
-        elif 0 < num_content <= 5:
-            if triggered_content:
-                for (url, note, step, first_seen_val) in triggered_content:
-                    _site, host = extract_site_domain(url)
-                    parts = [
-                        "❌ [ALERT] Ошибка контента на странице",
-                        f"Сайт: {site}",
-                        f"Страница: {host}",
-                        "Детали: обнаружен запрещённый текст",
-                        f"Время проверки: {timestamp}"
-                    ]
-                    if step in (4, 12, 50):
-                        parts.append(f"Повторный прогон ошибки: {step} (ошибка все еще актуальна)")
-                        if step in (12, 50):
-                            parts.insert(2, f"Время первой фиксации ошибки: {first_seen_val}")
-                            parts.insert(3, f"Сколько прогонов подряд падает: {step}")
-                    send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
         # Timeouts grouped
         if triggered_timeout:
             parts = [
@@ -951,17 +837,9 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
     # Save alert state (after all updates and notifications)
     save_alert_state(cfg.get("alert_state_file", ""), state)
 
-    num_ok = sum(
-        1
-        for (_u, _h, status, _ms, _e, content_error, _cn) in results
-        if (status is not None and 200 <= status < 400 and not content_error)
-    )
+    num_ok = sum(1 for (_u, _h, status, _ms, _e) in results if status is not None and 200 <= status < 400)
     # неуспехи учитываем только для 404 и 5xx (как по условиям алертов)
-    num_failed = sum(
-        1
-        for (_u, _h, status, _ms, _e, _ce, _cn) in results
-        if (status == 404) or (status is not None and 500 <= status < 600)
-    )
+    num_failed = sum(1 for (_u, _h, status, _ms, _e) in results if (status == 404) or (status is not None and 500 <= status < 600))
     return {"num_pages": len(results), "num_ok": num_ok, "num_failed": num_failed, "ssl_invalid": ssl_invalid_flag}
 
 
