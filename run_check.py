@@ -916,7 +916,7 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                         "❌ [ALERT] Ошибка контента на странице",
                         f"Сайт: {site}",
                         f"Страница: {host}",
-                        "Детали: обнаружен запрещённый текст",
+                        "Детали: Контент сайта недоступен",
                         f"Время проверки: {timestamp}"
                     ]
                     if step in (4, 12, 50):
@@ -1039,8 +1039,8 @@ def main():
     # Write stats.json if configured (aggregate per day, do not overwrite)
     if cfg.get("stats_file"):
         run_timestamp = now_local_str(cfg["timezone"])
-        # A run is successful if there were NO SSL issues and NO 404/5xx across all pages
-        success_run = 1 if (int(ssl_issues_sites) == 0 and int(total_failed_pages) == 0) else 0
+        # A run is successful if ALL pages are OK (same rule as for success Telegram) and no SSL issues
+        success_run = 1 if (int(total_pages) > 0 and int(total_ok) == int(total_pages) and int(ssl_issues_sites) == 0) else 0
         failure_run = 1 - success_run
         run_date = datetime.now(ZoneInfo(cfg["timezone"]))\
             .strftime("%Y-%m-%d")
@@ -1066,7 +1066,9 @@ def main():
             entry_success = int(entry.get("success", 0)) + success_run
             entry_failure = int(entry.get("failure", 0)) + failure_run
             entry_total_pages = int(entry.get("total_pages", 0)) + int(total_pages)
-            entry_failed_pages = int(entry.get("failed_pages", 0)) + int(total_failed_pages)
+            # Count failed pages in this run as total_pages - total_ok (includes timeouts/network/non-OK)
+            failed_pages_this_run = max(0, int(total_pages) - int(total_ok))
+            entry_failed_pages = int(entry.get("failed_pages", 0)) + failed_pages_this_run
             entry_ssl_issues_sites = int(entry.get("ssl_issues_sites", 0)) + int(ssl_issues_sites)
             entry_runs = int(entry.get("runs", 0)) + 1
 
