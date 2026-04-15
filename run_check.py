@@ -3,6 +3,7 @@ import random
 import ssl
 import socket
 import time
+import html
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -39,6 +40,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+_PROXY_MISSING_ENV_LOGGED = False
 
 
 # --------------- Env ---------------
@@ -55,6 +57,11 @@ def load_config() -> dict:
         "gsa_json": os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", ""),
         "bot_token": os.getenv("BOT_TOKEN", ""),
         "chat_id": os.getenv("CHAT_ID", ""),
+        "use_telegram_proxy": os.getenv("USE_TELEGRAM_PROXY", "false").lower() in {"1", "true", "yes"},
+        "telegram_proxy_url": os.getenv("TELEGRAM_PROXY_URL", "").strip(),
+        "telegram_proxy_auth_secret": os.getenv("TELEGRAM_PROXY_AUTH_SECRET", "").strip(),
+        "telegram_proxy_creds": os.getenv("TELEGRAM_PROXY_CREDS", "").strip(),
+        "telegram_proxy_timeout_sec": os.getenv("TELEGRAM_PROXY_TIMEOUT_SEC", "15").strip(),
         "alerts_enabled": os.getenv("ALERTS_ENABLED", "true").lower() in {"1", "true", "yes"},
         "timezone": os.getenv("TZ", DEFAULT_TZ),
         # daily: один лист на дату; per_run: новый лист на каждый запуск (по умолчанию)
@@ -121,9 +128,18 @@ def load_config() -> dict:
 
     # Helpful log to verify which chat id is used in CI
     try:
+        config["telegram_proxy_timeout_sec"] = float(config.get("telegram_proxy_timeout_sec", "15"))
+    except Exception:
+        config["telegram_proxy_timeout_sec"] = 15.0
+
+    try:
         logger.info(
-            "Config: ALERTS_ENABLED=%s SUCCESS_ALERTS_ENABLED=%s SHEET_MODE=%s CHAT_ID=%s",
-            config["alerts_enabled"], config.get("success_alerts_enabled", True), config.get("sheet_mode"), config.get("chat_id")
+            "Config: ALERTS_ENABLED=%s SUCCESS_ALERTS_ENABLED=%s SHEET_MODE=%s CHAT_ID=%s USE_TELEGRAM_PROXY=%s",
+            config["alerts_enabled"],
+            config.get("success_alerts_enabled", True),
+            config.get("sheet_mode"),
+            config.get("chat_id"),
+            config.get("use_telegram_proxy", False),
         )
     except Exception:
         pass
@@ -343,7 +359,83 @@ def append_rows(ws: gspread.Worksheet, rows: List[List[str]]):
 
 
 # --------------- Telegram ---------------
-def send_telegram_message(bot_token: str, chat_id: str, text: str):
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def send_telegram_message(
+    bot_token: str,
+    chat_id: str,
+    text: str,
+    *,
+    use_telegram_proxy: Optional[bool] = None,
+    telegram_proxy_url: Optional[str] = None,
+    telegram_proxy_auth_secret: Optional[str] = None,
+    telegram_proxy_creds: Optional[str] = None,
+    telegram_proxy_timeout_sec: Optional[float] = None,
+):
+    global _PROXY_MISSING_ENV_LOGGED
+
+    use_proxy = _env_bool("USE_TELEGRAM_PROXY", False) if use_telegram_proxy is None else bool(use_telegram_proxy)
+    if telegram_proxy_timeout_sec is None:
+        try:
+            timeout = float(os.getenv("TELEGRAM_PROXY_TIMEOUT_SEC", "15"))
+        except Exception:
+            timeout = 15.0
+    else:
+        timeout = float(telegram_proxy_timeout_sec)
+
+    if use_proxy:
+        proxy_url = (telegram_proxy_url or os.getenv("TELEGRAM_PROXY_URL") or "").strip()
+        auth_secret = (telegram_proxy_auth_secret or os.getenv("TELEGRAM_PROXY_AUTH_SECRET") or "").strip()
+        creds = (telegram_proxy_creds or os.getenv("TELEGRAM_PROXY_CREDS") or "").strip()
+
+        missing = []
+        if not proxy_url:
+            missing.append("TELEGRAM_PROXY_URL")
+        if not auth_secret:
+            missing.append("TELEGRAM_PROXY_AUTH_SECRET")
+        if not creds:
+            missing.append("TELEGRAM_PROXY_CREDS")
+
+        if missing:
+            if not _PROXY_MISSING_ENV_LOGGED:
+                logger.error("Telegram proxy missing required env vars: %s", ", ".join(missing))
+                _PROXY_MISSING_ENV_LOGGED = True
+            return
+
+        try:
+            resp = requests.post(
+                proxy_url,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Authentication": auth_secret,
+                },
+                json={
+                    "title": html.escape("Runtime alert"),
+                    "text": html.escape(text),
+                    "creds": creds,
+                    "parse_mode": "HTML",
+                    "disable_notification": False,
+                },
+                timeout=timeout,
+            )
+            if not resp.ok:
+                logger.error("Telegram proxy error: status=%s body=%s", resp.status_code, (resp.text or "")[:180])
+            return
+        except requests.Timeout:
+            logger.error("Telegram proxy timeout after %ss", timeout)
+            return
+        except requests.RequestException as e:
+            logger.error("Telegram proxy transport error: %s", e)
+            return
+        except Exception as e:
+            logger.error("Telegram proxy unexpected error: %s", e)
+            return
+
     if not bot_token or not chat_id:
         logger.warning("Telegram not configured: BOT_TOKEN/CHAT_ID missing")
         return
@@ -1094,3 +1186,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
