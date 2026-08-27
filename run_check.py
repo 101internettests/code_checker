@@ -1054,7 +1054,46 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
         for (_u, _h, status, _ms, _e, _ce, _cn) in results
         if (status == 404) or (status is not None and 500 <= status < 600)
     )
-    return {"num_pages": len(results), "num_ok": num_ok, "num_failed": num_failed, "ssl_invalid": ssl_invalid_flag}
+    error_counts = {
+        "404": len(errors_404),
+        "5xx": len(errors_5xx),
+        "timeout": len(errors_timeout),
+        "network": len(errors_network),
+        "content": len(errors_content),
+        "other": len(errors_other),
+    }
+    failed_urls = (
+        [(u, "404") for u in errors_404]
+        + [(u, f"5xx ({code})") for u, code in errors_5xx]
+        + [(u, "timeout") for u in errors_timeout]
+        + [(u, "network") for u in errors_network]
+        + [(u, "content") for u, _note in errors_content]
+        + [(u, f"HTTP {code}") for u, code in errors_other]
+    )
+    logger.info(
+        "RESULT site=%s checked=%d ok=%d failed=%d 404=%d 5xx=%d timeout=%d network=%d content=%d other=%d ssl=%s",
+        site,
+        len(results),
+        num_ok,
+        len(results) - num_ok,
+        error_counts["404"],
+        error_counts["5xx"],
+        error_counts["timeout"],
+        error_counts["network"],
+        error_counts["content"],
+        error_counts["other"],
+        "error" if ssl_invalid_flag else "ok",
+    )
+    for failed_url, error_kind in failed_urls:
+        logger.warning("RESULT_ERROR site=%s type=%s url=%s", site, error_kind, failed_url)
+
+    return {
+        "num_pages": len(results),
+        "num_ok": num_ok,
+        "num_failed": num_failed,
+        "ssl_invalid": ssl_invalid_flag,
+        "error_counts": error_counts,
+    }
 
 
 def main():
@@ -1102,6 +1141,14 @@ def main():
     total_ok = 0
     total_failed_pages = 0
     ssl_issues_sites = 0
+    total_error_counts = {
+        "404": 0,
+        "5xx": 0,
+        "timeout": 0,
+        "network": 0,
+        "content": 0,
+        "other": 0,
+    }
     run_start = time.perf_counter()
     for site, site_urls in groups.items():
         logger.info("Checking site: %s (%d pages)", site, len(site_urls))
@@ -1112,8 +1159,25 @@ def main():
                 total_ok += int(result.get("num_ok", 0))
                 total_failed_pages += int(result.get("num_failed", 0))
                 ssl_issues_sites += 1 if result.get("ssl_invalid") else 0
+                for error_kind, count in result.get("error_counts", {}).items():
+                    if error_kind in total_error_counts:
+                        total_error_counts[error_kind] += int(count)
         except Exception as e:
             logger.exception("Unexpected error while processing site %s: %s", site, e)
+
+    logger.info(
+        "RUN SUMMARY checked=%d ok=%d failed=%d 404=%d 5xx=%d timeout=%d network=%d content=%d other=%d ssl_sites=%d",
+        total_pages,
+        total_ok,
+        max(0, total_pages - total_ok),
+        total_error_counts["404"],
+        total_error_counts["5xx"],
+        total_error_counts["timeout"],
+        total_error_counts["network"],
+        total_error_counts["content"],
+        total_error_counts["other"],
+        ssl_issues_sites,
+    )
 
     # Success after whole run if no errors (controlled only by SUCCESS_ALERTS_ENABLED)
     if cfg.get("success_alerts_enabled", True):
