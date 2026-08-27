@@ -298,9 +298,28 @@ def request_with_timing(url: str, timeout: int, verify_ssl: bool = True, proxies
     except requests.Timeout:
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         return None, elapsed_ms, "timeout", None
+    except requests.exceptions.SSLError as e:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return None, elapsed_ms, f"SSL_ERROR: {e}", None
+    except requests.exceptions.ProxyError as e:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return None, elapsed_ms, f"PROXY_ERROR: {e}", None
+    except requests.exceptions.ConnectionError as e:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        detail = str(e)
+        detail_lower = detail.lower()
+        if "name or service not known" in detail_lower or "nodename nor servname" in detail_lower or "temporary failure in name resolution" in detail_lower or "getaddrinfo failed" in detail_lower:
+            error_kind = "DNS_ERROR"
+        elif "connection refused" in detail_lower:
+            error_kind = "CONNECTION_REFUSED"
+        elif "connection reset" in detail_lower or "reset by peer" in detail_lower:
+            error_kind = "CONNECTION_RESET"
+        else:
+            error_kind = "CONNECTION_ERROR"
+        return None, elapsed_ms, f"{error_kind}: {detail}", None
     except requests.RequestException as e:
         elapsed_ms = (time.perf_counter() - start) * 1000.0
-        return None, elapsed_ms, str(e), None
+        return None, elapsed_ms, f"REQUEST_ERROR: {e}", None
 
 
 # --------------- Google Sheets ---------------
@@ -1084,8 +1103,23 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
         error_counts["other"],
         "error" if ssl_invalid_flag else "ok",
     )
+    error_details = {
+        u: err
+        for (u, _h, status, _ms, err, _content_error, _content_note) in results
+        if status is None and err
+    }
     for failed_url, error_kind in failed_urls:
-        logger.warning("RESULT_ERROR site=%s type=%s url=%s", site, error_kind, failed_url)
+        detail = error_details.get(failed_url, "")
+        if detail:
+            logger.warning(
+                "RESULT_ERROR site=%s type=%s url=%s detail=%s",
+                site,
+                error_kind,
+                failed_url,
+                detail,
+            )
+        else:
+            logger.warning("RESULT_ERROR site=%s type=%s url=%s", site, error_kind, failed_url)
 
     return {
         "num_pages": len(results),
