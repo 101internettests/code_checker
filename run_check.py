@@ -263,19 +263,26 @@ def check_ssl_valid(domain: str, timeout: int = 30) -> Tuple[bool, Optional[str]
             with context.wrap_socket(sock, server_hostname=domain) as ssock:
                 cert = ssock.getpeercert()
                 if not cert:
-                    return False, "SSL: сертификат не получен"
+                    return False, "SSL_CERT_ERROR: сертификат не получен"
                 not_after = cert.get("notAfter")
                 if not_after:
                     # Example format: 'Jun 15 08:12:23 2026 GMT'
                     expiry_dt = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
                     if expiry_dt <= datetime.utcnow():
-                        return False, f"SSL: сертификат истёк {expiry_dt} UTC"
+                        return False, f"SSL_CERT_EXPIRED: сертификат истёк {expiry_dt} UTC"
                 # If handshake succeeded and not expired, we consider valid
                 return True, None
     except ssl.SSLCertVerificationError as e:
-        return False, f"SSL: ошибка верификации сертификата: {e}"
+        return False, f"SSL_CERT_ERROR: ошибка верификации сертификата: {e}"
     except Exception as e:
-        return False, f"SSL: ошибка соединения: {e}"
+        return False, f"SSL_CONNECTION_ERROR: {e}"
+
+
+def is_certificate_error(detail: Optional[str]) -> bool:
+    """Return true only for a certificate-specific SSL failure."""
+    if not detail:
+        return False
+    return detail.startswith(("SSL_CERT_ERROR:", "SSL_CERT_EXPIRED:"))
 
 
 # --------------- HTTP Request ---------------
@@ -508,7 +515,10 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
         for host in unique_hosts:
             ok, detail = check_ssl_valid(host)
             if not ok:
-                ssl_valid, ssl_detail = False, detail
+                if is_certificate_error(detail):
+                    ssl_valid, ssl_detail = False, detail
+                else:
+                    logger.warning("SSL probe connection failed for %s: %s; classify during HTTP check", host, detail)
                 break
     else:
         # Base mode: try apex and www-variant; consider valid if any passes
@@ -533,7 +543,21 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
             details_joined = "; ".join([
                 f"{d}: {det or 'unknown error'}" for (d, ok, det) in check_results if not ok
             ])
-            ssl_detail = details_joined or "SSL: сертификат недействителен"
+            certificate_failures = [
+                (d, det) for (d, ok, det) in check_results
+                if not ok and is_certificate_error(det)
+            ]
+            if certificate_failures:
+                ssl_detail = details_joined or "SSL_CERT_ERROR: сертификат недействителен"
+            else:
+                # A failed TCP/DNS/SSL probe is not proof of a bad certificate.
+                # Let the HTTP request classify the actual failure instead.
+                ssl_valid = True
+                logger.warning(
+                    "SSL probe could not connect to %s: %s; classify during HTTP check",
+                    site,
+                    details_joined or "unknown connection error",
+                )
 
     rows_to_append: List[List[str]] = []
     errors_404: List[str] = []
