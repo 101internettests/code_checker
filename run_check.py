@@ -739,16 +739,19 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
         pages_5xx = [(u, code) for (u, code) in errors_5xx]
         pages_404 = [u for u in errors_404]
         pages_timeout = [u for u in errors_timeout]
+        pages_network = [u for u in errors_network]
         pages_content = [(u, note) for (u, note) in errors_content]
 
         # ---------- Recovery detection before updating state ----------
         current_5xx_set = {u for (u, _c) in pages_5xx}
         current_404_set = set(pages_404)
         current_timeout_set = set(pages_timeout)
+        current_network_set = set(pages_network)
 
         prev_active_5xx = set()
         prev_active_404 = set()
         prev_active_timeout = set()
+        prev_active_network = set()
         prev_active_content = set()
         for k, st_old in list(state.items()):
             try:
@@ -763,12 +766,15 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                 prev_active_404.add(page_k)
             elif et_k == "timeout":
                 prev_active_timeout.add(page_k)
+            elif et_k == "network":
+                prev_active_network.add(page_k)
             elif et_k == "content_error":
                 prev_active_content.add(page_k)
 
         recovered_5xx = sorted(list(prev_active_5xx - current_5xx_set)) if prev_active_5xx else []
         recovered_404 = sorted(list(prev_active_404 - current_404_set)) if prev_active_404 else []
         recovered_timeout = sorted(list(prev_active_timeout - current_timeout_set)) if prev_active_timeout else []
+        recovered_network = sorted(list(prev_active_network - current_network_set)) if prev_active_network else []
         current_content_set = {u for (u, _n) in pages_content}
         recovered_content = sorted(list(prev_active_content - current_content_set)) if prev_active_content else []
 
@@ -858,6 +864,22 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                 if key_del in state:
                     del state[key_del]
 
+        # Network error recoveries (grouped list)
+        if recovered_network:
+            parts = [
+                f"✅ [ALERT] Сетевые ошибки на сайте {site} устранены",
+                "",
+                f"Страницы ({len(recovered_network)}):"
+            ]
+            parts.extend(f"- {url_ok}" for url_ok in recovered_network)
+            parts.append("")
+            parts.append(f"Время проверки: {timestamp}")
+            send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
+            for url_ok in recovered_network:
+                key_del = _state_key(site, url_ok, "network")
+                if key_del in state:
+                    del state[key_del]
+
         # Content error recoveries
         if recovered_content:
             if len(prev_active_content) > 5 and len(recovered_content) > 5:
@@ -887,6 +909,7 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
         triggered_5xx: List[Tuple[str, str, int, str]] = []  # (url, code_label, step, first_seen)
         triggered_404: List[Tuple[str, int, str]] = []  # (url, step, first_seen)
         triggered_timeout: List[Tuple[str, int, str]] = []  # (url, step, first_seen)
+        triggered_network: List[Tuple[str, int, str]] = []  # (url, step, first_seen)
         triggered_content: List[Tuple[str, str, int, str]] = []  # (url, note, step, first_seen)
 
         def update_page_error(url: str, error_type: str, code_label: Optional[str] = None):
@@ -903,6 +926,8 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                     triggered_404.append((url, step, stp.get('first_seen', timestamp)))
                 elif error_type == "timeout":
                     triggered_timeout.append((url, step, stp.get('first_seen', timestamp)))
+                elif error_type == "network":
+                    triggered_network.append((url, step, stp.get('first_seen', timestamp)))
                 elif error_type == "content_error":
                     triggered_content.append((url, code_label or "CONTENT_ERROR", step, stp.get('first_seen', timestamp)))
                 stp["last_notified_step"] = step
@@ -915,6 +940,8 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
             update_page_error(u, "http_404")
         for u in pages_timeout:
             update_page_error(u, "timeout")
+        for u in pages_network:
+            update_page_error(u, "network")
         for (u, note) in pages_content:
             update_page_error(u, "content_error", code_label=note)
 
@@ -1076,6 +1103,29 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                 parts.append(f"Повторный прогон ошибки: {stepv} (ошибка все еще актуальна)")
                 if stepv in (12, 50):
                     firsts = [fs for (_u, s, fs) in triggered_timeout if s == stepv and fs]
+                    first_seen_val = firsts[0] if firsts else timestamp
+                    parts.insert(2, f"Время первой фиксации ошибки: {first_seen_val}")
+                    parts.insert(3, f"Сколько прогонов подряд падает: {stepv}")
+            parts.append("")
+            parts.append(f"Время проверки: {timestamp}")
+            send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
+
+        # Network errors grouped to avoid one Telegram message per URL
+        if triggered_network:
+            parts = [
+                f"❌ [ALERT] Сетевые ошибки на сайте {site}",
+                "",
+                f"Страницы ({len(triggered_network)}):"
+            ]
+            for (url, _step, _fs) in triggered_network:
+                parts.append(f"- {url}")
+            rep_steps = [s for (_u, s, _fs) in triggered_network if s in (4, 12, 50)]
+            if rep_steps:
+                stepv = rep_steps[0]
+                parts.append("")
+                parts.append(f"Повторный прогон ошибки: {stepv} (ошибка все еще актуальна)")
+                if stepv in (12, 50):
+                    firsts = [fs for (_u, s, fs) in triggered_network if s == stepv and fs]
                     first_seen_val = firsts[0] if firsts else timestamp
                     parts.insert(2, f"Время первой фиксации ошибки: {first_seen_val}")
                     parts.insert(3, f"Сколько прогонов подряд падает: {stepv}")
