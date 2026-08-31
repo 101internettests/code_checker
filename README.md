@@ -11,3 +11,8 @@
 - `TELEGRAM_PROXY_TIMEOUT_SEC` (опционально, по умолчанию `15`)
 
 При `USE_TELEGRAM_PROXY=false` используется старый путь `BOT_TOKEN/CHAT_ID`.
+
+## Proxy fallback
+
+Повторная проверка неудачного запроса через proxy отключена по умолчанию, чтобы не увеличивать длительность прогона.
+Для явного включения задайте `PROXY_FALLBACK_ENABLED=true`.

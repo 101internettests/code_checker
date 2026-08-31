@@ -78,6 +78,8 @@ def load_config() -> dict:
         "proxy_urls_raw": os.getenv("PROXY_URLS", ""),
         # Percentage (0..100) of requests to send directly (without proxy) when proxies are enabled
         "proxy_direct_percent": os.getenv("PROXY_DIRECT_PERCENT", "0"),
+        # Optional second attempt through a proxy after a failed request. Disabled by default because it can double run time.
+        "proxy_fallback_enabled": os.getenv("PROXY_FALLBACK_ENABLED", "false").lower() in {"1", "true", "yes"},
         # Content validation: treat 200 responses as errors if body contains any of these substrings
         # Example: "Fatal error;Uncaught Exception"
         "content_error_substrings_raw": os.getenv("CONTENT_ERROR_SUBSTRINGS", "Fatal error")
@@ -134,12 +136,13 @@ def load_config() -> dict:
 
     try:
         logger.info(
-            "Config: ALERTS_ENABLED=%s SUCCESS_ALERTS_ENABLED=%s SHEET_MODE=%s CHAT_ID=%s USE_TELEGRAM_PROXY=%s",
+            "Config: ALERTS_ENABLED=%s SUCCESS_ALERTS_ENABLED=%s SHEET_MODE=%s CHAT_ID=%s USE_TELEGRAM_PROXY=%s PROXY_FALLBACK_ENABLED=%s",
             config["alerts_enabled"],
             config.get("success_alerts_enabled", True),
             config.get("sheet_mode"),
             config.get("chat_id"),
             config.get("use_telegram_proxy", False),
+            config.get("proxy_fallback_enabled", False),
         )
     except Exception:
         pass
@@ -615,7 +618,7 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
         def _is_ok(sc: Optional[int]) -> bool:
             return sc is not None and 200 <= sc < 400
 
-        if not _is_ok(status) and cfg.get("proxy_urls"):
+        if not _is_ok(status) and cfg.get("proxy_urls") and cfg.get("proxy_fallback_enabled", False):
             confirm_proxies = _select_random_proxy(cfg["proxy_urls"]) or None
             if confirm_proxies and isinstance(confirm_proxies, dict) and confirm_proxies.get("http"):
                 try:
