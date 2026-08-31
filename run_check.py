@@ -634,9 +634,23 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                 status, ms, err, body_text = c_status, c_ms, c_err, c_body_text
                 logger.info("Suppressed error after confirm via proxy for %s", u)
             else:
-                # Error confirmed – keep confirmed result
-                status, ms, err, body_text = c_status, c_ms, c_err, c_body_text
-                logger.info("Error confirmed after confirm via proxy for %s", u)
+                # If the confirmation itself fails, preserve the original error.
+                # A proxy 407 must not hide a direct DNS/SSL/connection failure.
+                if c_status is None:
+                    proxy_detail = c_err or "proxy confirmation failed"
+                    if err:
+                        err = f"{err}; PROXY_CONFIRMATION_ERROR: {proxy_detail}"
+                    else:
+                        err = f"PROXY_CONFIRMATION_ERROR: {proxy_detail}"
+                    logger.info(
+                        "Proxy confirmation failed; preserving original error for %s: %s",
+                        u,
+                        err,
+                    )
+                else:
+                    # Proxy returned an HTTP error, so use it as confirmation.
+                    status, ms, err, body_text = c_status, c_ms, c_err, c_body_text
+                    logger.info("Error confirmed after confirm via proxy for %s", u)
 
         _, host = extract_site_domain(u)
         # Content validation for successful statuses
