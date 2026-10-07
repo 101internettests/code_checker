@@ -78,8 +78,8 @@ def load_config() -> dict:
         "proxy_urls_raw": os.getenv("PROXY_URLS", ""),
         # Percentage (0..100) of requests to send directly (without proxy) when proxies are enabled
         "proxy_direct_percent": os.getenv("PROXY_DIRECT_PERCENT", "0"),
-        # Optional second attempt through a proxy after a failed request. Disabled by default because it can double run time.
-        "proxy_fallback_enabled": os.getenv("PROXY_FALLBACK_ENABLED", "false").lower() in {"1", "true", "yes"},
+        # Retry through the next configured proxy after a failed request.
+        "proxy_fallback_enabled": os.getenv("PROXY_FALLBACK_ENABLED", "true").lower() in {"1", "true", "yes"},
         # Content validation: treat 200 responses as errors if body contains any of these substrings
         # Example: "Fatal error;Uncaught Exception"
         "content_error_substrings_raw": os.getenv("CONTENT_ERROR_SUBSTRINGS", "Fatal error")
@@ -187,12 +187,16 @@ def extract_site_domain(url: str) -> Tuple[str, str]:
     return registered_domain, host
 
 
-def _select_random_proxy(proxy_urls: List[str]) -> Optional[Dict[str, str]]:
-    if not proxy_urls:
-        return None
-    proxy_url = random.choice(proxy_urls)
+def _proxy_config(proxy_url: str) -> Dict[str, str]:
     # Provide same proxy for http and https schemes
     return {"http": proxy_url, "https": proxy_url}
+
+
+def _select_proxy(proxy_urls: List[str], index: int = 0) -> Optional[Dict[str, str]]:
+    """Return a proxy by configured order, without randomly reusing one."""
+    if not proxy_urls or index < 0 or index >= len(proxy_urls):
+        return None
+    return _proxy_config(proxy_urls[index])
 
 
 def _proxy_label(proxy_url: str) -> str:
@@ -599,7 +603,7 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
             if _should_use_direct(int(cfg.get("proxy_direct_percent", 0))):
                 logger.info("Using direct connection for %s", u)
             else:
-                proxies = _select_random_proxy(cfg["proxy_urls"]) or None
+                proxies = _select_proxy(cfg["proxy_urls"], 0) or None
                 if proxies and isinstance(proxies, dict) and proxies.get("http"):
                     try:
                         label = _proxy_label(proxies.get("http", ""))
@@ -618,20 +622,36 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
         def _is_ok(sc: Optional[int]) -> bool:
             return sc is not None and 200 <= sc < 400
 
-        if not _is_ok(status) and cfg.get("proxy_urls") and cfg.get("proxy_fallback_enabled", False):
-            confirm_proxies = _select_random_proxy(cfg["proxy_urls"]) or None
+        if (
+            not _is_ok(status)
+            and cfg.get("proxy_urls")
+            and cfg.get("proxy_fallback_enabled", False)
+        ):
+            # The first proxy is always tried first. On failure, use the next
+            # configured proxy, so with two proxies the sequence is 1 -> 2.
+            first_proxy = cfg["proxy_urls"][0] if proxies else None
+            fallback_index = 1 if first_proxy else 0
+            confirm_proxies = (
+                _select_proxy(cfg["proxy_urls"], fallback_index)
+                if len(cfg["proxy_urls"]) > fallback_index
+                else None
+            )
+            if confirm_proxies is None:
+                logger.info("No fallback proxy configured for %s", u)
+                c_status, c_ms, c_err, c_body_text = None, 0.0, None, None
+            else:
+                c_status, c_ms, c_err, c_body_text = request_with_timing(
+                    u,
+                    cfg["timeout_seconds"],
+                    verify_ssl=ssl_valid,
+                    proxies=confirm_proxies
+                )
             if confirm_proxies and isinstance(confirm_proxies, dict) and confirm_proxies.get("http"):
                 try:
                     label2 = _proxy_label(confirm_proxies.get("http", ""))
                     logger.info("Confirm via proxy %s for %s", label2, u)
                 except Exception:
                     pass
-            c_status, c_ms, c_err, c_body_text = request_with_timing(
-                u,
-                cfg["timeout_seconds"],
-                verify_ssl=ssl_valid,
-                proxies=confirm_proxies
-            )
             if _is_ok(c_status):
                 # Suppress error – treat as success
                 status, ms, err, body_text = c_status, c_ms, c_err, c_body_text

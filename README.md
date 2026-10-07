@@ -14,5 +14,18 @@
 
 ## Proxy fallback
 
-Повторная проверка неудачного запроса через proxy отключена по умолчанию, чтобы не увеличивать длительность прогона.
-Для явного включения задайте `PROXY_FALLBACK_ENABLED=true`.
+`PROXY_URLS` задаётся в порядке приоритета: сначала используется первый proxy,
+при ошибке запроса — следующий. Для двух proxy порядок такой: `proxy-1 -> proxy-2`.
+
+Fallback включён по умолчанию. Его можно явно отключить через
+`PROXY_FALLBACK_ENABLED=false`.
+
+Чтобы запросы всегда шли через proxy, задайте `PROXY_DIRECT_PERCENT=0`.
+
+## Jenkins schedule
+
+Для запуска один раз в час в настройках Jenkins job:
+
+- удалите trigger `Build after other projects are built` и любые downstream/upstream triggers;
+- оставьте только `Build periodically` с cron-выражением `H * * * *`;
+- для proxy-режима задайте `PROXIES_ENABLED=true`, `PROXY_DIRECT_PERCENT=0` и передайте два адреса в `PROXY_URLS` в нужном порядке.
