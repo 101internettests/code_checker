@@ -8,7 +8,6 @@ import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Tuple, Optional
-from urllib.parse import urlsplit
 
 import requests
 import pandas as pd
@@ -27,7 +26,6 @@ requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 # --------------- Configuration ---------------
 DEFAULT_TIMEOUT_SECONDS = 20
 DEFAULT_TZ = os.environ.get("TZ", "Europe/Moscow")
-EXCLUDED_URL_HOSTS = {"mts-home-gpon.ru"}
 
 
 # --------------- Logging ---------------
@@ -497,20 +495,7 @@ def read_url_list(file_path: str, url_column_name: str) -> List[str]:
         # Fallback to first column
         col = df.columns[0]
     urls = [str(u).strip() for u in df[col].dropna().tolist() if str(u).strip()]
-
-    def is_excluded(url: str) -> bool:
-        parsed = urlsplit(url if "://" in url else f"//{url}")
-        host = (parsed.hostname or "").lower().rstrip(".")
-        return any(host == excluded or host.endswith(f".{excluded}") for excluded in EXCLUDED_URL_HOSTS)
-
-    excluded_urls = [url for url in urls if is_excluded(url)]
-    if excluded_urls:
-        logger.warning(
-            "Excluded %d URL(s) from configured landing domain(s): %s",
-            len(excluded_urls),
-            ", ".join(sorted(EXCLUDED_URL_HOSTS)),
-        )
-    return [url for url in urls if not is_excluded(url)]
+    return urls
 
 
 def group_urls_by_site(urls: List[str]) -> Dict[str, List[str]]:
