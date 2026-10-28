@@ -78,6 +78,8 @@ def load_config() -> dict:
         "proxy_urls_raw": os.getenv("PROXY_URLS", ""),
         # Percentage (0..100) of requests to send directly (without proxy) when proxies are enabled
         "proxy_direct_percent": os.getenv("PROXY_DIRECT_PERCENT", "0"),
+        # Registrable domains that must always bypass proxies, separated by comma/semicolon/newline
+        "proxy_bypass_domains_raw": os.getenv("PROXY_BYPASS_DOMAINS", ""),
         # Retry through the next configured proxy after a failed request.
         "proxy_fallback_enabled": os.getenv("PROXY_FALLBACK_ENABLED", "true").lower() in {"1", "true", "yes"},
         # Content validation: treat 200 responses as errors if body contains any of these substrings
@@ -109,6 +111,16 @@ def load_config() -> dict:
         direct_percent = 100
     config["proxy_direct_percent"] = direct_percent
 
+    raw_bypass = str(config.get("proxy_bypass_domains_raw", ""))
+    for sep in ["\n", ";", ",", " "]:
+        if sep in raw_bypass:
+            raw_bypass = raw_bypass.replace(sep, "\n")
+    config["proxy_bypass_domains"] = sorted({
+        domain.strip().lower()
+        for domain in raw_bypass.split("\n")
+        if domain.strip()
+    })
+
     # Parse content error substrings list
     raw_content = str(config.get("content_error_substrings_raw", "")).strip()
     if raw_content:
@@ -136,13 +148,14 @@ def load_config() -> dict:
 
     try:
         logger.info(
-            "Config: ALERTS_ENABLED=%s SUCCESS_ALERTS_ENABLED=%s SHEET_MODE=%s CHAT_ID=%s USE_TELEGRAM_PROXY=%s PROXY_FALLBACK_ENABLED=%s",
+            "Config: ALERTS_ENABLED=%s SUCCESS_ALERTS_ENABLED=%s SHEET_MODE=%s CHAT_ID=%s USE_TELEGRAM_PROXY=%s PROXY_FALLBACK_ENABLED=%s PROXY_BYPASS_DOMAINS=%s",
             config["alerts_enabled"],
             config.get("success_alerts_enabled", True),
             config.get("sheet_mode"),
             config.get("chat_id"),
             config.get("use_telegram_proxy", False),
             config.get("proxy_fallback_enabled", False),
+            ",".join(config.get("proxy_bypass_domains", [])) or "-",
         )
     except Exception:
         pass
@@ -599,7 +612,11 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
     for u in urls:
         # If SSL is invalid, bypass verification to still get HTTP status codes
         proxies = None
-        if cfg.get("proxies_enabled") and cfg.get("proxy_urls"):
+        site_domain, _ = extract_site_domain(u)
+        direct_bypass = site_domain.lower() in cfg.get("proxy_bypass_domains", [])
+        if direct_bypass:
+            logger.info("Using direct connection (proxy bypass) for %s", u)
+        elif cfg.get("proxies_enabled") and cfg.get("proxy_urls"):
             if _should_use_direct(int(cfg.get("proxy_direct_percent", 0))):
                 logger.info("Using direct connection for %s", u)
             else:
@@ -624,6 +641,7 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
 
         if (
             not _is_ok(status)
+            and not direct_bypass
             and cfg.get("proxy_urls")
             and cfg.get("proxy_fallback_enabled", False)
         ):
