@@ -797,6 +797,18 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
         pages_network = [u for u in errors_network]
         pages_content = [(u, note) for (u, note) in errors_content]
 
+        def append_page_list(parts: List[str], page_urls: List[str], limit: int = 20):
+            """Add concrete page URLs to an alert without exceeding Telegram limits."""
+            if not page_urls:
+                return
+            parts.append("")
+            parts.append("Страницы:")
+            for page_url in page_urls[:limit]:
+                parts.append(f"- {page_url}")
+            remaining = len(page_urls) - limit
+            if remaining > 0:
+                parts.append(f"... и еще {remaining} страниц")
+
         # ---------- Recovery detection before updating state ----------
         current_5xx_set = {u for (u, _c) in pages_5xx}
         current_404_set = set(pages_404)
@@ -853,11 +865,10 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                 send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
             else:
                 for url_ok in recovered_5xx:
-                    _s, host_ok = extract_site_domain(url_ok)
                     parts = [
                         "✅ [ALERT] Страница снова доступна",
                         f"Сайт: {site}",
-                        f"Страница: {host_ok}",
+                        f"Страница: {url_ok}",
                         "Код: 200",
                         f"Время проверки: {timestamp}"
                     ]
@@ -887,11 +898,10 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                 send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
             else:
                 for url_ok in recovered_404:
-                    _s, host_ok = extract_site_domain(url_ok)
                     parts = [
                         "✅ [ALERT] Страница снова доступна",
                         f"Сайт: {site}",
-                        f"Страница: {host_ok}",
+                        f"Страница: {url_ok}",
                         "Код: 200",
                         f"Время проверки: {timestamp}"
                     ]
@@ -947,11 +957,10 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                 send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
             else:
                 for url_ok in recovered_content:
-                    _s, host_ok = extract_site_domain(url_ok)
                     parts = [
                         "✅ [ALERT] Проблема контента устранена",
                         f"Сайт: {site}",
-                        f"Страница: {host_ok}",
+                        f"Страница: {url_ok}",
                         f"Время проверки: {timestamp}"
                     ]
                     send_telegram_message(cfg["bot_token"], cfg["chat_id"], "\n".join(parts))
@@ -1037,6 +1046,7 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                         f"{num_5xx} страниц сайта вернули ошибку 5хх",
                         f"Время проверки: {timestamp}"
                     ]
+                append_page_list(parts, [u for u, _code in pages_5xx])
                 rep_steps = [s for (_u, _c, s, _fs) in triggered_5xx if s in (4, 12, 50)]
                 if rep_steps:
                     stepv = rep_steps[0]
@@ -1051,11 +1061,10 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
             if triggered_5xx:
                 # Send one message per page as per spec
                 for (url, code_label, step, first_seen_val) in triggered_5xx:
-                    _site, host = extract_site_domain(url)
                     parts = [
                         "❌ [ALERT] Ошибка доступа к страницам",
                         f"Сайт: {site}",
-                        f"Страница: {host}",
+                        f"Страница: {url}",
                         f"Тип ошибки: {code_label}",
                         f"Время проверки: {timestamp}"
                     ]
@@ -1082,6 +1091,7 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
                         f"{num_404} страниц сайта вернули ошибку 404",
                         f"Время проверки: {timestamp}"
                     ]
+                append_page_list(parts, pages_404)
                 rep_steps = [s for (_u, s, _fs) in triggered_404 if s in (4, 12, 50)]
                 if rep_steps:
                     stepv = rep_steps[0]
@@ -1095,11 +1105,10 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
         elif 0 < num_404 <= 5:
             if triggered_404:
                 for (url, step, first_seen_val) in triggered_404:
-                    _site, host = extract_site_domain(url)
                     parts = [
                         "❌ [ALERT] Ошибка доступа к страницам",
                         f"Сайт: {site}",
-                        f"Страница: {host}",
+                        f"Страница: {url}",
                         "Тип ошибки: 404",
                         f"Время проверки: {timestamp}"
                     ]
@@ -1128,11 +1137,10 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
         elif 0 < num_content <= 5:
             if triggered_content:
                 for (url, note, step, first_seen_val) in triggered_content:
-                    _site, host = extract_site_domain(url)
                     parts = [
                         "❌ [ALERT] Ошибка контента на странице",
                         f"Сайт: {site}",
-                        f"Страница: {host}",
+                        f"Страница: {url}",
                         "Детали: Контент сайта недоступен",
                         f"Время проверки: {timestamp}"
                     ]
@@ -1240,15 +1248,15 @@ def run_for_site(site: str, urls: List[str], cfg: dict, gc: Optional[gspread.Cli
     for failed_url, error_kind in failed_urls:
         detail = error_details.get(failed_url, "")
         if detail:
-            logger.warning(
-                "RESULT_ERROR site=%s type=%s url=%s detail=%s",
+            logger.error(
+                "PAGE_ERROR site=%s type=%s url=%s detail=%s",
                 site,
                 error_kind,
                 failed_url,
                 detail,
             )
         else:
-            logger.warning("RESULT_ERROR site=%s type=%s url=%s", site, error_kind, failed_url)
+            logger.error("PAGE_ERROR site=%s type=%s url=%s", site, error_kind, failed_url)
 
     return {
         "num_pages": len(results),
